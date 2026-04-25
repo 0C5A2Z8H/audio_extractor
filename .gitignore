@@ -1,0 +1,73 @@
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+conda-meta/
+
+# Local IDE/editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local notes and source materials
+background/
+docs/
+prompt/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Generated datasets and manifests
+SatelliteAudio/
+data/
+datasets/
+outputs/
+artifacts/
+extraction_manifest.csv
+*_manifest.csv
+
+# Large generated media/features
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.aac
+*.ogg
+*.iq
+*.npy
+*.npz
+
+# Model training outputs
+checkpoints/
+runs/
+wandb/
+mlruns/
+*.ckpt
+*.pt
+*.pth
+*.onnx

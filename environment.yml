@@ -1,0 +1,8 @@
+name: audio_cls
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - ffmpeg
+  - openpyxl
+  - msoffcrypto-tool

@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""Extract labelled satellite audio clips from hourly server recordings.
+
+Expected server layout:
+
+    D:\AudioRecord\LX20260407\LX20260407-010000.m4a
+
+The script reads an annotation workbook, takes start/end timestamps and a label
+column, cuts the matching ranges from hourly recordings with ffmpeg, decodes them
+to WAV, and writes a manifest for reproducibility.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import io
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Iterable
+
+
+INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Cut labelled clips from hourly satellite audio recordings."
+    )
+    parser.add_argument("--audio-root", type=Path, default=Path.cwd())
+    parser.add_argument("--excel", type=Path, required=True)
+    parser.add_argument("--password", default=None)
+    parser.add_argument("--sheet", default=None, help="Worksheet name. Defaults to active sheet.")
+    parser.add_argument("--station", default="LX")
+    parser.add_argument("--source-ext", default="m4a")
+    parser.add_argument("--start-col", default="B")
+    parser.add_argument("--end-col", default="C")
+    parser.add_argument("--label-col", default="AK")
+    parser.add_argument("--first-data-row", type=int, default=2)
+    parser.add_argument("--output-root", type=Path, default=None)
+    parser.add_argument("--manifest", type=Path, default=None)
+    parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument("--sample-rate", type=int, default=None)
+    parser.add_argument("--channels", type=int, default=None)
+    parser.add_argument("--pre-roll-sec", type=float, default=0.0)
+    parser.add_argument("--post-roll-sec", type=float, default=0.0)
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--limit", type=int, default=None)
+    return parser.parse_args()
+
+
+def load_workbook(path: Path, password: str | None):
+    try:
+        from openpyxl import load_workbook as openpyxl_load_workbook
+    except ImportError as exc:
+        raise SystemExit("Missing dependency: install openpyxl on the server.") from exc
+
+    try:
+        return openpyxl_load_workbook(path, data_only=True, read_only=True)
+    except Exception as first_error:
+        if not password:
+            raise SystemExit(
+                f"Could not open workbook {path}. If it is encrypted, pass --password."
+            ) from first_error
+
+        try:
+            import msoffcrypto
+        except ImportError as exc:
+            raise SystemExit(
+                "Workbook appears encrypted. Install msoffcrypto-tool or save an "
+                "unencrypted copy of the workbook on the server."
+            ) from exc
+
+        decrypted = io.BytesIO()
+        with path.open("rb") as handle:
+            office_file = msoffcrypto.OfficeFile(handle)
+            office_file.load_key(password=password)
+            office_file.decrypt(decrypted)
+        decrypted.seek(0)
+        return openpyxl_load_workbook(decrypted, data_only=True, read_only=True)
+
+
+def column_index(column: str) -> int:
+    result = 0
+    for char in column.strip().upper():
+        if not ("A" <= char <= "Z"):
+            raise ValueError(f"Invalid Excel column: {column}")
+        result = result * 26 + (ord(char) - ord("A") + 1)
+    return result
+
+
+def parse_excel_datetime(value) -> dt.datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, dt.datetime):
+        return value.replace(tzinfo=None)
+    if isinstance(value, dt.date):
+        return dt.datetime.combine(value, dt.time.min)
+    if isinstance(value, (int, float)):
+        try:
+            from openpyxl.utils.datetime import from_excel
+        except ImportError as exc:
+            raise SystemExit("Missing dependency: install openpyxl on the server.") from exc
+        parsed = from_excel(value)
+        if isinstance(parsed, dt.datetime):
+            return parsed.replace(tzinfo=None)
+        if isinstance(parsed, dt.time):
+            return dt.datetime.combine(dt.date.today(), parsed)
+        return dt.datetime.combine(parsed, dt.time.min)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    formats = (
+        "%Y/%m/%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%d %H:%M",
+        "%Y%m%d %H:%M:%S",
+    )
+    for fmt in formats:
+        try:
+            return dt.datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+    raise ValueError(f"Unsupported datetime value: {value!r}")
+
+
+def sanitize_label(value) -> str:
+    label = str(value).strip() if value is not None else ""
+    label = INVALID_FILENAME_CHARS.sub("_", label)
+    label = re.sub(r"\s+", " ", label).strip(" .")
+    return label
+
+
+def floor_to_hour(value: dt.datetime) -> dt.datetime:
+    return value.replace(minute=0, second=0, microsecond=0)
+
+
+def source_path(audio_root: Path, station: str, ext: str, timestamp: dt.datetime) -> Path:
+    day = timestamp.strftime("%Y%m%d")
+    hour = timestamp.strftime("%H")
+    return audio_root / f"{station}{day}" / f"{station}{day}-{hour}0000.{ext.lstrip('.')}"
+
+
+def iter_chunks(
+    start: dt.datetime, end: dt.datetime
+) -> Iterable[tuple[dt.datetime, dt.datetime]]:
+    cursor = start
+    while cursor < end:
+        next_hour = floor_to_hour(cursor) + dt.timedelta(hours=1)
+        chunk_end = min(end, next_hour)
+        yield cursor, chunk_end
+        cursor = chunk_end
+
+
+def ffmpeg_cut_command(
+    ffmpeg: str,
+    input_path: Path,
+    output_path: Path,
+    offset_sec: float,
+    duration_sec: float,
+    overwrite: bool,
+    sample_rate: int | None,
+    channels: int | None,
+) -> list[str]:
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error"]
+    command.append("-y" if overwrite else "-n")
+    command.extend(["-i", str(input_path), "-ss", f"{offset_sec:.3f}", "-t", f"{duration_sec:.3f}"])
+    command.extend(["-vn", "-acodec", "pcm_s16le"])
+    if sample_rate:
+        command.extend(["-ar", str(sample_rate)])
+    if channels:
+        command.extend(["-ac", str(channels)])
+    command.append(str(output_path))
+    return command
+
+
+def run_command(command: list[str]) -> None:
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        joined = " ".join(command)
+        raise RuntimeError(f"Command failed: {joined}\n{result.stderr.strip()}")
+
+
+def concat_wavs(ffmpeg: str, parts: list[Path], output_path: Path, overwrite: bool) -> None:
+    with tempfile.TemporaryDirectory(prefix="audio_concat_") as temp_dir:
+        list_path = Path(temp_dir) / "inputs.txt"
+        lines = []
+        for part in parts:
+            safe_path = part.resolve().as_posix().replace("'", "'\\''")
+            lines.append(f"file '{safe_path}'")
+        list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y" if overwrite else "-n",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_path),
+            "-c",
+            "copy",
+            str(output_path),
+        ]
+        run_command(command)
+
+
+def output_filename(station: str, row_index: int, start: dt.datetime, end: dt.datetime) -> str:
+    return (
+        f"{station}_{start:%Y%m%d_%H%M%S}_{end:%Y%m%d_%H%M%S}"
+        f"_row{row_index:05d}.wav"
+    )
+
+
+def extract_clip(
+    args: argparse.Namespace,
+    row_index: int,
+    label: str,
+    start: dt.datetime,
+    end: dt.datetime,
+) -> tuple[Path, list[Path]]:
+    output_root = args.output_root or (args.audio_root / "SatelliteAudio" / "raw")
+    output_dir = output_root / label
+    output_path = output_dir / output_filename(args.station, row_index, start, end)
+
+    sources: list[Path] = []
+    chunks = list(iter_chunks(start, end))
+    for chunk_start, _ in chunks:
+        path = source_path(args.audio_root, args.station, args.source_ext, chunk_start)
+        sources.append(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Missing source recording: {path}")
+
+    if args.dry_run:
+        return output_path, sources
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and not args.overwrite:
+        raise FileExistsError(f"Output exists, use --overwrite to replace: {output_path}")
+
+    if len(chunks) == 1:
+        chunk_start, chunk_end = chunks[0]
+        hour_start = floor_to_hour(chunk_start)
+        offset_sec = (chunk_start - hour_start).total_seconds()
+        duration_sec = (chunk_end - chunk_start).total_seconds()
+        command = ffmpeg_cut_command(
+            args.ffmpeg,
+            sources[0],
+            output_path,
+            offset_sec,
+            duration_sec,
+            args.overwrite,
+            args.sample_rate,
+            args.channels,
+        )
+        run_command(command)
+        return output_path, sources
+
+    with tempfile.TemporaryDirectory(prefix="audio_extract_") as temp_dir:
+        temp_root = Path(temp_dir)
+        parts: list[Path] = []
+        for index, (chunk_start, chunk_end) in enumerate(chunks):
+            hour_start = floor_to_hour(chunk_start)
+            offset_sec = (chunk_start - hour_start).total_seconds()
+            duration_sec = (chunk_end - chunk_start).total_seconds()
+            part_path = temp_root / f"part_{index:03d}.wav"
+            command = ffmpeg_cut_command(
+                args.ffmpeg,
+                source_path(args.audio_root, args.station, args.source_ext, chunk_start),
+                part_path,
+                offset_sec,
+                duration_sec,
+                True,
+                args.sample_rate,
+                args.channels,
+            )
+            run_command(command)
+            parts.append(part_path)
+        concat_wavs(args.ffmpeg, parts, output_path, args.overwrite)
+
+    return output_path, sources
+
+
+def select_sheet(workbook, sheet_name: str | None):
+    if sheet_name:
+        if sheet_name not in workbook.sheetnames:
+            raise SystemExit(
+                f"Worksheet {sheet_name!r} not found. Available sheets: {workbook.sheetnames}"
+            )
+        return workbook[sheet_name]
+    return workbook.active
+
+
+def main() -> int:
+    args = parse_args()
+    args.audio_root = args.audio_root.resolve()
+    args.excel = args.excel.resolve()
+    if args.output_root:
+        args.output_root = args.output_root.resolve()
+    if args.manifest:
+        args.manifest = args.manifest.resolve()
+    else:
+        manifest_root = args.output_root or (args.audio_root / "SatelliteAudio" / "raw")
+        args.manifest = (manifest_root.parent / "extraction_manifest.csv").resolve()
+
+    if not shutil.which(args.ffmpeg):
+        raise SystemExit(f"ffmpeg not found: {args.ffmpeg}")
+
+    workbook = load_workbook(args.excel, args.password)
+    worksheet = select_sheet(workbook, args.sheet)
+
+    start_idx = column_index(args.start_col)
+    end_idx = column_index(args.end_col)
+    label_idx = column_index(args.label_col)
+
+    args.manifest.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "row_index",
+        "sample_id",
+        "label",
+        "start_time",
+        "end_time",
+        "duration_sec",
+        "output_path",
+        "source_files",
+        "status",
+        "message",
+    ]
+
+    processed = 0
+    written = 0
+    skipped = 0
+    failed = 0
+
+    with args.manifest.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for row_index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+            if row_index < args.first_data_row:
+                continue
+            if args.limit is not None and processed >= args.limit:
+                break
+            processed += 1
+
+            raw_label = row[label_idx - 1] if len(row) >= label_idx else None
+            label = sanitize_label(raw_label)
+            if not label or label in {"?", "？"}:
+                skipped += 1
+                writer.writerow(
+                    {
+                        "row_index": row_index,
+                        "sample_id": "",
+                        "label": str(raw_label or ""),
+                        "start_time": "",
+                        "end_time": "",
+                        "duration_sec": "",
+                        "output_path": "",
+                        "source_files": "",
+                        "status": "skipped",
+                        "message": "empty_or_unknown_label",
+                    }
+                )
+                continue
+
+            try:
+                raw_start = row[start_idx - 1] if len(row) >= start_idx else None
+                raw_end = row[end_idx - 1] if len(row) >= end_idx else None
+                start = parse_excel_datetime(raw_start)
+                end = parse_excel_datetime(raw_end)
+                if start is None or end is None:
+                    raise ValueError("Missing start or end time")
+
+                start = start - dt.timedelta(seconds=args.pre_roll_sec)
+                end = end + dt.timedelta(seconds=args.post_roll_sec)
+                if end <= start:
+                    raise ValueError(f"End time must be after start time: {start} -> {end}")
+
+                output_path, sources = extract_clip(args, row_index, label, start, end)
+                duration_sec = (end - start).total_seconds()
+                sample_id = output_path.stem
+                written += 1
+                writer.writerow(
+                    {
+                        "row_index": row_index,
+                        "sample_id": sample_id,
+                        "label": label,
+                        "start_time": start.isoformat(sep=" "),
+                        "end_time": end.isoformat(sep=" "),
+                        "duration_sec": f"{duration_sec:.3f}",
+                        "output_path": str(output_path),
+                        "source_files": ";".join(str(path) for path in sources),
+                        "status": "dry_run" if args.dry_run else "ok",
+                        "message": "",
+                    }
+                )
+            except Exception as exc:
+                failed += 1
+                writer.writerow(
+                    {
+                        "row_index": row_index,
+                        "sample_id": "",
+                        "label": label,
+                        "start_time": "",
+                        "end_time": "",
+                        "duration_sec": "",
+                        "output_path": "",
+                        "source_files": "",
+                        "status": "failed",
+                        "message": str(exc),
+                    }
+                )
+
+    print(
+        "Extraction complete: "
+        f"processed={processed}, written={written}, skipped={skipped}, "
+        f"failed={failed}, manifest={args.manifest}"
+    )
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
