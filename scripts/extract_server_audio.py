@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -53,6 +54,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--no-progress", action="store_true", help="Disable console progress bar.")
+    parser.add_argument(
+        "--progress-interval-sec",
+        type=float,
+        default=0.2,
+        help="Minimum seconds between progress bar refreshes.",
+    )
     return parser.parse_args()
 
 
@@ -305,6 +313,82 @@ def select_sheet(workbook, sheet_name: str | None):
     return workbook.active
 
 
+class ProgressReporter:
+    def __init__(self, enabled: bool, total: int | None, interval_sec: float) -> None:
+        self.enabled = enabled
+        self.total = total if total and total > 0 else None
+        self.interval_sec = max(interval_sec, 0.0)
+        self.last_update = 0.0
+        self.started_at = time.monotonic()
+
+    def update(
+        self,
+        processed: int,
+        written: int,
+        skipped: int,
+        failed: int,
+        row_index: int | None = None,
+        label: str | None = None,
+        force: bool = False,
+    ) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if not force and now - self.last_update < self.interval_sec:
+            return
+        self.last_update = now
+
+        elapsed = now - self.started_at
+        stats = f"ok={written} skipped={skipped} failed={failed} elapsed={format_duration(elapsed)}"
+        detail = ""
+        if row_index is not None:
+            detail = f" row={row_index}"
+        if label:
+            detail += f" label={shorten(label, 24)}"
+
+        if self.total:
+            ratio = min(processed / self.total, 1.0)
+            width = 30
+            filled = int(width * ratio)
+            bar = "#" * filled + "-" * (width - filled)
+            message = f"\r[{bar}] {processed}/{self.total} {ratio * 100:5.1f}% {stats}{detail}"
+        else:
+            message = f"\rprocessed={processed} {stats}{detail}"
+
+        sys.stderr.write(message[:180].ljust(180))
+        sys.stderr.flush()
+
+    def finish(self) -> None:
+        if self.enabled:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+
+def format_duration(seconds: float) -> str:
+    seconds_int = int(seconds)
+    hours, remainder = divmod(seconds_int, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def shorten(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    return value[: max_length - 3] + "..."
+
+
+def estimate_total_rows(worksheet, first_data_row: int, limit: int | None) -> int | None:
+    max_row = getattr(worksheet, "max_row", None)
+    if max_row is None:
+        return limit
+    total = max(max_row - first_data_row + 1, 0)
+    if limit is not None:
+        total = min(total, limit)
+    return total
+
+
 def main() -> int:
     args = parse_args()
     args.audio_root = args.audio_root.resolve()
@@ -345,85 +429,108 @@ def main() -> int:
     written = 0
     skipped = 0
     failed = 0
+    total_rows = estimate_total_rows(worksheet, args.first_data_row, args.limit)
+    progress = ProgressReporter(
+        enabled=not args.no_progress,
+        total=total_rows,
+        interval_sec=args.progress_interval_sec,
+    )
 
-    with args.manifest.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
+    try:
+        progress.update(processed, written, skipped, failed, force=True)
+        with args.manifest.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
 
-        for row_index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
-            if row_index < args.first_data_row:
-                continue
-            if args.limit is not None and processed >= args.limit:
-                break
-            processed += 1
+            for row_index, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+                if row_index < args.first_data_row:
+                    continue
+                if args.limit is not None and processed >= args.limit:
+                    break
+                processed += 1
 
-            raw_label = row[label_idx - 1] if len(row) >= label_idx else None
-            label = sanitize_label(raw_label)
-            if not label or label in {"?", "？"}:
-                skipped += 1
-                writer.writerow(
-                    {
-                        "row_index": row_index,
-                        "sample_id": "",
-                        "label": str(raw_label or ""),
-                        "start_time": "",
-                        "end_time": "",
-                        "duration_sec": "",
-                        "output_path": "",
-                        "source_files": "",
-                        "status": "skipped",
-                        "message": "empty_or_unknown_label",
-                    }
+                raw_label = row[label_idx - 1] if len(row) >= label_idx else None
+                label = sanitize_label(raw_label)
+                progress.update(
+                    processed,
+                    written,
+                    skipped,
+                    failed,
+                    row_index=row_index,
+                    label=label,
+                    force=True,
                 )
-                continue
+                if not label or label in {"?", "？"}:
+                    skipped += 1
+                    writer.writerow(
+                        {
+                            "row_index": row_index,
+                            "sample_id": "",
+                            "label": str(raw_label or ""),
+                            "start_time": "",
+                            "end_time": "",
+                            "duration_sec": "",
+                            "output_path": "",
+                            "source_files": "",
+                            "status": "skipped",
+                            "message": "empty_or_unknown_label",
+                        }
+                    )
+                    progress.update(processed, written, skipped, failed)
+                    continue
 
-            try:
-                raw_start = row[start_idx - 1] if len(row) >= start_idx else None
-                raw_end = row[end_idx - 1] if len(row) >= end_idx else None
-                start = parse_excel_datetime(raw_start)
-                end = parse_excel_datetime(raw_end)
-                if start is None or end is None:
-                    raise ValueError("Missing start or end time")
+                try:
+                    raw_start = row[start_idx - 1] if len(row) >= start_idx else None
+                    raw_end = row[end_idx - 1] if len(row) >= end_idx else None
+                    start = parse_excel_datetime(raw_start)
+                    end = parse_excel_datetime(raw_end)
+                    if start is None or end is None:
+                        raise ValueError("Missing start or end time")
 
-                start = start - dt.timedelta(seconds=args.pre_roll_sec)
-                end = end + dt.timedelta(seconds=args.post_roll_sec)
-                if end <= start:
-                    raise ValueError(f"End time must be after start time: {start} -> {end}")
+                    start = start - dt.timedelta(seconds=args.pre_roll_sec)
+                    end = end + dt.timedelta(seconds=args.post_roll_sec)
+                    if end <= start:
+                        raise ValueError(f"End time must be after start time: {start} -> {end}")
 
-                output_path, sources = extract_clip(args, row_index, label, start, end)
-                duration_sec = (end - start).total_seconds()
-                sample_id = output_path.stem
-                written += 1
-                writer.writerow(
-                    {
-                        "row_index": row_index,
-                        "sample_id": sample_id,
-                        "label": label,
-                        "start_time": start.isoformat(sep=" "),
-                        "end_time": end.isoformat(sep=" "),
-                        "duration_sec": f"{duration_sec:.3f}",
-                        "output_path": str(output_path),
-                        "source_files": ";".join(str(path) for path in sources),
-                        "status": "dry_run" if args.dry_run else "ok",
-                        "message": "",
-                    }
-                )
-            except Exception as exc:
-                failed += 1
-                writer.writerow(
-                    {
-                        "row_index": row_index,
-                        "sample_id": "",
-                        "label": label,
-                        "start_time": "",
-                        "end_time": "",
-                        "duration_sec": "",
-                        "output_path": "",
-                        "source_files": "",
-                        "status": "failed",
-                        "message": str(exc),
-                    }
-                )
+                    output_path, sources = extract_clip(args, row_index, label, start, end)
+                    duration_sec = (end - start).total_seconds()
+                    sample_id = output_path.stem
+                    written += 1
+                    writer.writerow(
+                        {
+                            "row_index": row_index,
+                            "sample_id": sample_id,
+                            "label": label,
+                            "start_time": start.isoformat(sep=" "),
+                            "end_time": end.isoformat(sep=" "),
+                            "duration_sec": f"{duration_sec:.3f}",
+                            "output_path": str(output_path),
+                            "source_files": ";".join(str(path) for path in sources),
+                            "status": "dry_run" if args.dry_run else "ok",
+                            "message": "",
+                        }
+                    )
+                except Exception as exc:
+                    failed += 1
+                    writer.writerow(
+                        {
+                            "row_index": row_index,
+                            "sample_id": "",
+                            "label": label,
+                            "start_time": "",
+                            "end_time": "",
+                            "duration_sec": "",
+                            "output_path": "",
+                            "source_files": "",
+                            "status": "failed",
+                            "message": str(exc),
+                        }
+                    )
+                finally:
+                    progress.update(processed, written, skipped, failed)
+    finally:
+        progress.update(processed, written, skipped, failed, force=True)
+        progress.finish()
 
     print(
         "Extraction complete: "
