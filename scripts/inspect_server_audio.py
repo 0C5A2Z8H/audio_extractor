@@ -10,6 +10,8 @@ import json
 import re
 import shutil
 import subprocess
+import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -31,7 +33,68 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dates", nargs="*", default=None, help="YYYYMMDD dates to inspect.")
     parser.add_argument("--ffprobe", default="ffprobe")
     parser.add_argument("--skip-ffprobe", action="store_true")
+    parser.add_argument("--no-progress", action="store_true", help="Disable console progress bar.")
+    parser.add_argument("--progress-interval-sec", type=float, default=0.2)
     return parser.parse_args()
+
+
+def raise_csv_field_limit() -> None:
+    limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(limit)
+            return
+        except OverflowError:
+            limit = int(limit / 10)
+
+
+class ProgressReporter:
+    def __init__(self, enabled: bool, interval_sec: float) -> None:
+        self.enabled = enabled
+        self.interval_sec = max(interval_sec, 0.0)
+        self.last_update = 0.0
+        self.started_at = time.monotonic()
+
+    def update(self, stage: str, current: int, total: int | None = None, detail: str = "", force: bool = False) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        if not force and now - self.last_update < self.interval_sec:
+            return
+        self.last_update = now
+        elapsed = format_duration(now - self.started_at)
+        if total and total > 0:
+            ratio = min(current / total, 1.0)
+            width = 30
+            filled = int(width * ratio)
+            bar = "#" * filled + "-" * (width - filled)
+            message = f"\r{stage} [{bar}] {current}/{total} {ratio * 100:5.1f}% elapsed={elapsed}"
+        else:
+            message = f"\r{stage} {current} elapsed={elapsed}"
+        if detail:
+            message += f" {shorten(detail, 60)}"
+        sys.stderr.write(message[:180].ljust(180))
+        sys.stderr.flush()
+
+    def finish(self) -> None:
+        if self.enabled:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+
+def format_duration(seconds: float) -> str:
+    seconds_int = int(seconds)
+    hours, remainder = divmod(seconds_int, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def shorten(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    return value[: max_length - 3] + "..."
 
 
 def parse_source_time(path: Path) -> dt.datetime | None:
@@ -126,8 +189,12 @@ def write_csv(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) 
 def main() -> int:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    raise_csv_field_limit()
+    progress = ProgressReporter(not args.no_progress, args.progress_interval_sec)
 
+    progress.update("Reading manifest", 0, force=True)
     needed, status_counts, failed_rows = read_manifest_sources(args.manifest)
+    progress.update("Reading manifest", 1, 1, force=True)
     dates = infer_dates(args.audio_root, args.station, args.dates, needed)
     if not dates:
         date_dirs = sorted(args.audio_root.glob(f"{args.station}[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]"))
@@ -140,7 +207,8 @@ def main() -> int:
     files_by_day: defaultdict[str, int] = defaultdict(int)
     files = list_audio_files(args.audio_root, args.station, args.source_ext, dates)
 
-    for file_path in files:
+    progress.update("Inspecting audio", 0, len(files), force=True)
+    for index, file_path in enumerate(files, start=1):
         start = parse_source_time(file_path)
         duration, probe_error = (None, "")
         if do_ffprobe:
@@ -161,9 +229,12 @@ def main() -> int:
                 "ffprobe_error": probe_error,
             }
         )
+        progress.update("Inspecting audio", index, len(files), file_path.name)
 
     needed_rows: list[dict[str, object]] = []
-    for path in sorted(needed, key=str):
+    needed_list = sorted(needed, key=str)
+    progress.update("Checking sources", 0, len(needed_list), force=True)
+    for index, path in enumerate(needed_list, start=1):
         needed_rows.append(
             {
                 "path": str(path),
@@ -171,6 +242,7 @@ def main() -> int:
                 "size_bytes": path.stat().st_size if path.exists() else "",
             }
         )
+        progress.update("Checking sources", index, len(needed_list), path.name)
 
     failed_type_counts = Counter()
     for row in failed_rows:
@@ -229,6 +301,8 @@ def main() -> int:
         report_lines.append(f"  ... {len(missing_needed) - 200} more")
 
     (args.output_dir / "summary.txt").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+    progress.update("Writing reports", 1, 1, force=True)
+    progress.finish()
 
     print(f"Wrote inspection report to: {args.output_dir}")
     print(f"Inventory rows: {len(inventory_rows)}")
