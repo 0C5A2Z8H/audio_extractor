@@ -48,6 +48,7 @@ data/
 datasets/
 outputs/
 artifacts/
+server_inspection/
 extraction_manifest.csv
 *_manifest.csv
 

@@ -16,6 +16,7 @@ import argparse
 import csv
 import datetime as dt
 import io
+import json
 import os
 import re
 import shutil
@@ -28,6 +29,7 @@ from typing import Iterable
 
 
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+SOURCE_NAME_RE = re.compile(r"^(?P<station>[A-Za-z]+)(?P<day>\d{8})-(?P<clock>\d{6})\.(?P<ext>\w+)$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +49,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--ffmpeg", default="ffmpeg")
+    parser.add_argument("--ffprobe", default="ffprobe")
+    parser.add_argument(
+        "--source-match-mode",
+        choices=("coverage", "exact-hour"),
+        default="coverage",
+        help="coverage scans real recording intervals; exact-hour uses STATIONYYYYMMDD-HH0000.ext.",
+    )
     parser.add_argument("--sample-rate", type=int, default=None)
     parser.add_argument("--channels", type=int, default=None)
     parser.add_argument("--pre-roll-sec", type=float, default=0.0)
@@ -159,15 +168,141 @@ def source_path(audio_root: Path, station: str, ext: str, timestamp: dt.datetime
     return audio_root / f"{station}{day}" / f"{station}{day}-{hour}0000.{ext.lstrip('.')}"
 
 
-def iter_chunks(
+def iter_hour_chunks(
     start: dt.datetime, end: dt.datetime
-) -> Iterable[tuple[dt.datetime, dt.datetime]]:
+) -> Iterable[tuple[dt.datetime, dt.datetime, Path | None, dt.datetime]]:
     cursor = start
     while cursor < end:
         next_hour = floor_to_hour(cursor) + dt.timedelta(hours=1)
         chunk_end = min(end, next_hour)
-        yield cursor, chunk_end
+        yield cursor, chunk_end, None, floor_to_hour(cursor)
         cursor = chunk_end
+
+
+def parse_source_start(path: Path, station: str, ext: str) -> dt.datetime | None:
+    match = SOURCE_NAME_RE.match(path.name)
+    if not match:
+        return None
+    if match.group("station") != station or match.group("ext").lower() != ext.lstrip(".").lower():
+        return None
+    return dt.datetime.strptime(match.group("day") + match.group("clock"), "%Y%m%d%H%M%S")
+
+
+def ffprobe_duration(ffprobe: str, path: Path) -> tuple[float | None, str]:
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        str(path),
+    ]
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        return None, result.stderr.strip()
+    try:
+        payload = json.loads(result.stdout)
+        return float(payload["format"]["duration"]), ""
+    except Exception as exc:
+        return None, f"Could not parse ffprobe output: {exc}"
+
+
+def get_day_inventory(args: argparse.Namespace, day: str) -> list[dict[str, object]]:
+    if not hasattr(args, "_source_inventory"):
+        args._source_inventory = {}
+    if day in args._source_inventory:
+        return args._source_inventory[day]
+
+    day_dir = args.audio_root / f"{args.station}{day}"
+    ext = args.source_ext.lstrip(".")
+    intervals: list[dict[str, object]] = []
+    if day_dir.exists():
+        for path in sorted(day_dir.glob(f"{args.station}{day}-*.{ext}")):
+            start = parse_source_start(path, args.station, args.source_ext)
+            if start is None:
+                continue
+            duration, probe_error = ffprobe_duration(args.ffprobe, path)
+            if duration is None:
+                intervals.append(
+                    {
+                        "path": path,
+                        "start": start,
+                        "end": None,
+                        "probe_error": probe_error,
+                    }
+                )
+                continue
+            intervals.append(
+                {
+                    "path": path,
+                    "start": start,
+                    "end": start + dt.timedelta(seconds=duration),
+                    "probe_error": "",
+                }
+            )
+    intervals.sort(key=lambda item: item["start"])
+    args._source_inventory[day] = intervals
+    return intervals
+
+
+def dates_between(start: dt.datetime, end: dt.datetime) -> list[str]:
+    cursor = start.date()
+    last = end.date()
+    days: list[str] = []
+    while cursor <= last:
+        days.append(cursor.strftime("%Y%m%d"))
+        cursor += dt.timedelta(days=1)
+    return days
+
+
+def resolve_exact_hour_segments(
+    args: argparse.Namespace, start: dt.datetime, end: dt.datetime
+) -> list[tuple[Path, dt.datetime, dt.datetime, dt.datetime]]:
+    segments: list[tuple[Path, dt.datetime, dt.datetime, dt.datetime]] = []
+    for chunk_start, chunk_end, _, file_start in iter_hour_chunks(start, end):
+        path = source_path(args.audio_root, args.station, args.source_ext, chunk_start)
+        if not path.exists():
+            raise FileNotFoundError(f"Missing source recording: {path}")
+        segments.append((path, chunk_start, chunk_end, file_start))
+    return segments
+
+
+def resolve_coverage_segments(
+    args: argparse.Namespace, start: dt.datetime, end: dt.datetime
+) -> list[tuple[Path, dt.datetime, dt.datetime, dt.datetime]]:
+    intervals: list[dict[str, object]] = []
+    for day in dates_between(start - dt.timedelta(days=1), end):
+        intervals.extend(get_day_inventory(args, day))
+    intervals = [item for item in intervals if item["end"] is not None]
+    intervals.sort(key=lambda item: item["start"])
+
+    segments: list[tuple[Path, dt.datetime, dt.datetime, dt.datetime]] = []
+    cursor = start
+    while cursor < end:
+        covering = [
+            item
+            for item in intervals
+            if item["start"] <= cursor and item["end"] and cursor < item["end"]
+        ]
+        if not covering:
+            future = [item for item in intervals if item["start"] > cursor]
+            next_hint = ""
+            if future:
+                next_item = future[0]
+                next_hint = f"; next recording starts at {next_item['start']} ({next_item['path']})"
+            raise FileNotFoundError(f"No source recording covers {cursor}{next_hint}")
+
+        item = covering[-1]
+        file_start = item["start"]
+        file_end = item["end"]
+        segment_end = min(end, file_end)
+        if segment_end <= cursor:
+            raise RuntimeError(f"Invalid recording interval for {item['path']}")
+        segments.append((item["path"], cursor, segment_end, file_start))
+        cursor = segment_end
+    return segments
 
 
 def ffmpeg_cut_command(
@@ -245,13 +380,11 @@ def extract_clip(
     output_dir = output_root / label
     output_path = output_dir / output_filename(args.station, row_index, start, end)
 
-    sources: list[Path] = []
-    chunks = list(iter_chunks(start, end))
-    for chunk_start, _ in chunks:
-        path = source_path(args.audio_root, args.station, args.source_ext, chunk_start)
-        sources.append(path)
-        if not path.exists():
-            raise FileNotFoundError(f"Missing source recording: {path}")
+    if args.source_match_mode == "exact-hour":
+        segments = resolve_exact_hour_segments(args, start, end)
+    else:
+        segments = resolve_coverage_segments(args, start, end)
+    sources = [segment[0] for segment in segments]
 
     if args.dry_run:
         return output_path, sources
@@ -260,14 +393,13 @@ def extract_clip(
     if output_path.exists() and not args.overwrite:
         raise FileExistsError(f"Output exists, use --overwrite to replace: {output_path}")
 
-    if len(chunks) == 1:
-        chunk_start, chunk_end = chunks[0]
-        hour_start = floor_to_hour(chunk_start)
-        offset_sec = (chunk_start - hour_start).total_seconds()
-        duration_sec = (chunk_end - chunk_start).total_seconds()
+    if len(segments) == 1:
+        source, segment_start, segment_end, file_start = segments[0]
+        offset_sec = (segment_start - file_start).total_seconds()
+        duration_sec = (segment_end - segment_start).total_seconds()
         command = ffmpeg_cut_command(
             args.ffmpeg,
-            sources[0],
+            source,
             output_path,
             offset_sec,
             duration_sec,
@@ -281,14 +413,13 @@ def extract_clip(
     with tempfile.TemporaryDirectory(prefix="audio_extract_") as temp_dir:
         temp_root = Path(temp_dir)
         parts: list[Path] = []
-        for index, (chunk_start, chunk_end) in enumerate(chunks):
-            hour_start = floor_to_hour(chunk_start)
-            offset_sec = (chunk_start - hour_start).total_seconds()
-            duration_sec = (chunk_end - chunk_start).total_seconds()
+        for index, (source, segment_start, segment_end, file_start) in enumerate(segments):
+            offset_sec = (segment_start - file_start).total_seconds()
+            duration_sec = (segment_end - segment_start).total_seconds()
             part_path = temp_root / f"part_{index:03d}.wav"
             command = ffmpeg_cut_command(
                 args.ffmpeg,
-                source_path(args.audio_root, args.station, args.source_ext, chunk_start),
+                source,
                 part_path,
                 offset_sec,
                 duration_sec,
@@ -403,6 +534,8 @@ def main() -> int:
 
     if not shutil.which(args.ffmpeg):
         raise SystemExit(f"ffmpeg not found: {args.ffmpeg}")
+    if args.source_match_mode == "coverage" and not shutil.which(args.ffprobe):
+        raise SystemExit(f"ffprobe not found: {args.ffprobe}")
 
     workbook = load_workbook(args.excel, args.password)
     worksheet = select_sheet(workbook, args.sheet)
