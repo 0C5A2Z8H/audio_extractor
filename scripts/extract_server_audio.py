@@ -47,6 +47,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-col", default="AK")
     parser.add_argument("--first-data-row", type=int, default=2)
     parser.add_argument("--output-root", type=Path, default=None)
+    parser.add_argument(
+        "--clear-output-root",
+        action="store_true",
+        help="Delete existing files under --output-root before extraction. Ignored in --dry-run.",
+    )
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
@@ -453,6 +458,32 @@ def mark_recovered_output(
     return recovered_path
 
 
+def safe_clear_output_root(output_root: Path, audio_root: Path) -> None:
+    resolved_output = output_root.resolve()
+    resolved_audio = audio_root.resolve()
+
+    if resolved_output.name.lower() != "raw":
+        raise SystemExit(
+            f"Refusing to clear {resolved_output}: --clear-output-root only accepts a directory named 'raw'."
+        )
+    if resolved_output.anchor == str(resolved_output):
+        raise SystemExit(f"Refusing to clear drive root: {resolved_output}")
+    if resolved_output == resolved_audio or resolved_audio in resolved_output.parents:
+        raise SystemExit(
+            f"Refusing to clear {resolved_output}: output root must not be inside audio root {resolved_audio}."
+        )
+    if not resolved_output.exists():
+        return
+    if not resolved_output.is_dir():
+        raise SystemExit(f"Refusing to clear non-directory output root: {resolved_output}")
+
+    for child in resolved_output.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
 def extract_clip(
     args: argparse.Namespace,
     row_index: int,
@@ -460,8 +491,7 @@ def extract_clip(
     start: dt.datetime,
     end: dt.datetime,
 ) -> tuple[Path, list[Path], str]:
-    output_root = args.output_root or (args.audio_root / "SatelliteAudio" / "raw")
-    output_dir = output_root / label
+    output_dir = args.output_root / label
     output_path = output_dir / output_filename(args.station, row_index, start, end)
 
     if args.source_match_mode == "exact-hour":
@@ -616,16 +646,23 @@ def main() -> int:
     args.excel = args.excel.resolve()
     if args.output_root:
         args.output_root = args.output_root.resolve()
+    else:
+        args.output_root = (args.audio_root / "SatelliteAudio" / "raw").resolve()
     if args.manifest:
         args.manifest = args.manifest.resolve()
     else:
-        manifest_root = args.output_root or (args.audio_root / "SatelliteAudio" / "raw")
-        args.manifest = (manifest_root.parent / "extraction_manifest.csv").resolve()
+        args.manifest = (args.output_root.parent / "extraction_manifest.csv").resolve()
 
     if not shutil.which(args.ffmpeg):
         raise SystemExit(f"ffmpeg not found: {args.ffmpeg}")
     if args.source_match_mode == "coverage" and not shutil.which(args.ffprobe):
         raise SystemExit(f"ffprobe not found: {args.ffprobe}")
+
+    if args.clear_output_root:
+        if args.dry_run:
+            print("--clear-output-root ignored because --dry-run is set.")
+        else:
+            safe_clear_output_root(args.output_root, args.audio_root)
 
     workbook = load_workbook(args.excel, args.password)
     worksheet = select_sheet(workbook, args.sheet)
