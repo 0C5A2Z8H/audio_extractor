@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -21,6 +22,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True, help="Output per-class CSV report.")
     parser.add_argument("--summary", type=Path, default=None, help="Optional text summary path.")
     return parser.parse_args()
+
+
+def raise_csv_field_limit() -> None:
+    limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(limit)
+            return
+        except OverflowError:
+            limit = int(limit / 10)
 
 
 def rows_from_raw_root(raw_root: Path) -> list[dict[str, object]]:
@@ -116,6 +127,7 @@ def write_summary(path: Path, rows: list[dict[str, object]]) -> None:
 
 def main() -> int:
     args = parse_args()
+    raise_csv_field_limit()
     if bool(args.raw_root) == bool(args.manifest):
         raise SystemExit("Pass exactly one of --raw-root or --manifest.")
 
