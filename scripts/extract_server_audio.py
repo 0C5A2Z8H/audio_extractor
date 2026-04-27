@@ -314,10 +314,17 @@ def ffmpeg_cut_command(
     overwrite: bool,
     sample_rate: int | None,
     channels: int | None,
+    seek_mode: str = "output",
+    ignore_decode_errors: bool = False,
 ) -> list[str]:
     command = [ffmpeg, "-hide_banner", "-loglevel", "error"]
     command.append("-y" if overwrite else "-n")
-    command.extend(["-i", str(input_path), "-ss", f"{offset_sec:.3f}", "-t", f"{duration_sec:.3f}"])
+    if ignore_decode_errors:
+        command.extend(["-err_detect", "ignore_err", "-fflags", "+discardcorrupt"])
+    if seek_mode == "input":
+        command.extend(["-ss", f"{offset_sec:.3f}", "-i", str(input_path), "-t", f"{duration_sec:.3f}"])
+    else:
+        command.extend(["-i", str(input_path), "-ss", f"{offset_sec:.3f}", "-t", f"{duration_sec:.3f}"])
     command.extend(["-vn", "-acodec", "pcm_s16le"])
     if sample_rate:
         command.extend(["-ar", str(sample_rate)])
@@ -332,6 +339,56 @@ def run_command(command: list[str]) -> None:
     if result.returncode != 0:
         joined = " ".join(command)
         raise RuntimeError(f"Command failed: {joined}\n{result.stderr.strip()}")
+
+
+def remove_partial_output(path: Path) -> None:
+    if path.exists():
+        path.unlink()
+
+
+def run_cut_with_fallback(
+    args: argparse.Namespace,
+    input_path: Path,
+    output_path: Path,
+    offset_sec: float,
+    duration_sec: float,
+    overwrite: bool,
+) -> str:
+    primary = ffmpeg_cut_command(
+        args.ffmpeg,
+        input_path,
+        output_path,
+        offset_sec,
+        duration_sec,
+        overwrite,
+        args.sample_rate,
+        args.channels,
+    )
+    try:
+        run_command(primary)
+        return "primary"
+    except RuntimeError as primary_error:
+        remove_partial_output(output_path)
+        fallback = ffmpeg_cut_command(
+            args.ffmpeg,
+            input_path,
+            output_path,
+            offset_sec,
+            duration_sec,
+            True,
+            args.sample_rate,
+            args.channels,
+            seek_mode="input",
+            ignore_decode_errors=True,
+        )
+        try:
+            run_command(fallback)
+            return "recover"
+        except RuntimeError as fallback_error:
+            raise RuntimeError(
+                f"Primary ffmpeg cut failed, fallback also failed.\n"
+                f"Primary error:\n{primary_error}\n\nFallback error:\n{fallback_error}"
+            ) from fallback_error
 
 
 def concat_wavs(ffmpeg: str, parts: list[Path], output_path: Path, overwrite: bool) -> None:
@@ -362,11 +419,38 @@ def concat_wavs(ffmpeg: str, parts: list[Path], output_path: Path, overwrite: bo
         run_command(command)
 
 
-def output_filename(station: str, row_index: int, start: dt.datetime, end: dt.datetime) -> str:
+def output_filename(
+    station: str,
+    row_index: int,
+    start: dt.datetime,
+    end: dt.datetime,
+    quality_suffix: str = "",
+) -> str:
+    suffix = f"_{quality_suffix}" if quality_suffix else ""
     return (
         f"{station}_{start:%Y%m%d_%H%M%S}_{end:%Y%m%d_%H%M%S}"
-        f"_row{row_index:05d}.wav"
+        f"_row{row_index:05d}{suffix}.wav"
     )
+
+
+def mark_recovered_output(
+    output_dir: Path,
+    output_path: Path,
+    station: str,
+    row_index: int,
+    start: dt.datetime,
+    end: dt.datetime,
+    overwrite: bool,
+) -> Path:
+    recovered_path = output_dir / output_filename(station, row_index, start, end, "recover")
+    if recovered_path == output_path:
+        return output_path
+    if recovered_path.exists() and not overwrite:
+        raise FileExistsError(f"Recovered output exists, use --overwrite to replace: {recovered_path}")
+    if recovered_path.exists():
+        recovered_path.unlink()
+    output_path.replace(recovered_path)
+    return recovered_path
 
 
 def extract_clip(
@@ -375,7 +459,7 @@ def extract_clip(
     label: str,
     start: dt.datetime,
     end: dt.datetime,
-) -> tuple[Path, list[Path]]:
+) -> tuple[Path, list[Path], str]:
     output_root = args.output_root or (args.audio_root / "SatelliteAudio" / "raw")
     output_dir = output_root / label
     output_path = output_dir / output_filename(args.station, row_index, start, end)
@@ -387,28 +471,31 @@ def extract_clip(
     sources = [segment[0] for segment in segments]
 
     if args.dry_run:
-        return output_path, sources
+        return output_path, sources, "dry_run"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and not args.overwrite:
         raise FileExistsError(f"Output exists, use --overwrite to replace: {output_path}")
 
+    decode_statuses: list[str] = []
     if len(segments) == 1:
         source, segment_start, segment_end, file_start = segments[0]
         offset_sec = (segment_start - file_start).total_seconds()
         duration_sec = (segment_end - segment_start).total_seconds()
-        command = ffmpeg_cut_command(
-            args.ffmpeg,
+        decode_status = run_cut_with_fallback(
+            args,
             source,
             output_path,
             offset_sec,
             duration_sec,
             args.overwrite,
-            args.sample_rate,
-            args.channels,
         )
-        run_command(command)
-        return output_path, sources
+        decode_statuses.append(decode_status)
+        if decode_status == "recover":
+            output_path = mark_recovered_output(
+                output_dir, output_path, args.station, row_index, start, end, args.overwrite
+            )
+        return output_path, sources, ",".join(decode_statuses)
 
     with tempfile.TemporaryDirectory(prefix="audio_extract_") as temp_dir:
         temp_root = Path(temp_dir)
@@ -417,21 +504,24 @@ def extract_clip(
             offset_sec = (segment_start - file_start).total_seconds()
             duration_sec = (segment_end - segment_start).total_seconds()
             part_path = temp_root / f"part_{index:03d}.wav"
-            command = ffmpeg_cut_command(
-                args.ffmpeg,
+            decode_status = run_cut_with_fallback(
+                args,
                 source,
                 part_path,
                 offset_sec,
                 duration_sec,
                 True,
-                args.sample_rate,
-                args.channels,
             )
-            run_command(command)
+            decode_statuses.append(decode_status)
             parts.append(part_path)
         concat_wavs(args.ffmpeg, parts, output_path, args.overwrite)
 
-    return output_path, sources
+    if "recover" in decode_statuses:
+        output_path = mark_recovered_output(
+            output_dir, output_path, args.station, row_index, start, end, args.overwrite
+        )
+
+    return output_path, sources, ",".join(decode_statuses)
 
 
 def select_sheet(workbook, sheet_name: str | None):
@@ -554,6 +644,7 @@ def main() -> int:
         "duration_sec",
         "output_path",
         "source_files",
+        "decode_status",
         "status",
         "message",
     ]
@@ -605,6 +696,7 @@ def main() -> int:
                             "duration_sec": "",
                             "output_path": "",
                             "source_files": "",
+                            "decode_status": "",
                             "status": "skipped",
                             "message": "empty_or_unknown_label",
                         }
@@ -625,7 +717,7 @@ def main() -> int:
                     if end <= start:
                         raise ValueError(f"End time must be after start time: {start} -> {end}")
 
-                    output_path, sources = extract_clip(args, row_index, label, start, end)
+                    output_path, sources, decode_status = extract_clip(args, row_index, label, start, end)
                     duration_sec = (end - start).total_seconds()
                     sample_id = output_path.stem
                     written += 1
@@ -639,6 +731,7 @@ def main() -> int:
                             "duration_sec": f"{duration_sec:.3f}",
                             "output_path": str(output_path),
                             "source_files": ";".join(str(path) for path in sources),
+                            "decode_status": decode_status,
                             "status": "dry_run" if args.dry_run else "ok",
                             "message": "",
                         }
@@ -655,6 +748,7 @@ def main() -> int:
                             "duration_sec": "",
                             "output_path": "",
                             "source_files": "",
+                            "decode_status": "",
                             "status": "failed",
                             "message": str(exc),
                         }
