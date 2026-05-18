@@ -233,6 +233,9 @@ def raise_csv_field_limit() -> None:
 
 
 def read_annotation_rows(args: argparse.Namespace) -> tuple[list[dict[str, object]], dict[str, int], dict[str, int], str]:
+    if not args.no_progress:
+        sys.stderr.write("\rLoading Excel annotations...".ljust(180))
+        sys.stderr.flush()
     workbook = load_workbook(args.excel, args.password)
     worksheet = workbook[args.sheet] if args.sheet else workbook.active
     start_idx = column_index(args.start_col)
@@ -242,7 +245,7 @@ def read_annotation_rows(args: argparse.Namespace) -> tuple[list[dict[str, objec
     marker_text = normalize_cell_text(args.invalid_marker)
 
     total_rows = max((getattr(worksheet, "max_row", 0) or 0) - args.first_data_row + 1, 0)
-    progress = ProgressReporter(not args.no_progress, total_rows, args.progress_interval_sec, "标注检查")
+    progress = ProgressReporter(not args.no_progress, total_rows, args.progress_interval_sec, "Annotation check")
     rows: list[dict[str, object]] = []
     counts: dict[str, int] = {}
     unexpected_invalid_values: dict[str, int] = {}
@@ -363,7 +366,7 @@ def generate_audio_inventory(args: argparse.Namespace) -> tuple[list[dict[str, o
     inventory_rows: list[dict[str, object]] = []
     files_by_day: defaultdict[str, int] = defaultdict(int)
     files = list_audio_files(args.audio_root, args.station, args.source_ext, dates)
-    progress = ProgressReporter(not args.no_progress, len(files), args.progress_interval_sec, "录音库存")
+    progress = ProgressReporter(not args.no_progress, len(files), args.progress_interval_sec, "Audio inventory")
     progress.update(0, force=True)
     for index, file_path in enumerate(files, start=1):
         start = parse_source_time(file_path)
@@ -497,6 +500,9 @@ def generate_row_report(args: argparse.Namespace, annotation_rows: list[dict[str
     inventory_path = data_dir(args) / "audio_inventory.csv"
     if not inventory_path.exists():
         return [], {}
+    if not args.no_progress:
+        sys.stderr.write("\rLoading Excel annotations for coverage check...".ljust(180))
+        sys.stderr.flush()
     workbook = load_workbook(args.excel, args.password)
     worksheet = workbook[args.sheet] if args.sheet else workbook.active
     intervals = read_inventory(inventory_path)
@@ -508,7 +514,7 @@ def generate_row_report(args: argparse.Namespace, annotation_rows: list[dict[str
     marker_text = normalize_cell_text(args.invalid_marker)
 
     total_rows = max((getattr(worksheet, "max_row", 0) or 0) - args.first_data_row + 1, 0)
-    progress = ProgressReporter(not args.no_progress, total_rows, args.progress_interval_sec, "覆盖检查")
+    progress = ProgressReporter(not args.no_progress, total_rows, args.progress_interval_sec, "Coverage check")
     rows: list[dict[str, object]] = []
     counts: dict[str, int] = {}
     processed = 0
@@ -658,7 +664,7 @@ def manifest_data_row_count(manifest: Path) -> int:
 def rows_from_manifest(manifest: Path, args: argparse.Namespace) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     total = manifest_data_row_count(manifest)
-    progress = ProgressReporter(not args.no_progress, total, args.progress_interval_sec, "数据集统计")
+    progress = ProgressReporter(not args.no_progress, total, args.progress_interval_sec, "Dataset counts")
     progress.update(0, force=True)
     with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -686,7 +692,7 @@ def rows_from_raw_root(raw_root: Path, args: argparse.Namespace) -> list[dict[st
         for audio_path in sorted(path for path in class_dir.rglob("*") if path.is_file())
         if audio_path.suffix.lower() in AUDIO_EXTS
     ]
-    progress = ProgressReporter(not args.no_progress, len(audio_paths), args.progress_interval_sec, "数据集统计")
+    progress = ProgressReporter(not args.no_progress, len(audio_paths), args.progress_interval_sec, "Dataset counts")
     rows: list[dict[str, object]] = []
     progress.update(0, force=True)
     for index, audio_path in enumerate(audio_paths, start=1):
@@ -833,7 +839,7 @@ def main() -> int:
     if not args.skip_dataset_counts:
         dataset_rows = generate_dataset_counts(args)
     write_human_reports(args, annotation_counts, unexpected_invalid_values, worksheet_title, row_report, dates, files_by_day, dataset_rows)
-    print(f"报告已写入: {args.output_dir}")
+    print(f"Reports written to: {args.output_dir}")
     return 0
 
 
