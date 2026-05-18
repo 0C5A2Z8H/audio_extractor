@@ -159,6 +159,10 @@ def read_manifest_sources(manifest: Path | None) -> tuple[set[Path], Counter, li
 def infer_dates(audio_root: Path, station: str, dates: list[str] | None, needed: set[Path]) -> list[str]:
     if dates:
         return sorted(dates)
+    date_dirs = sorted(audio_root.glob(f"{station}[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]"))
+    if date_dirs:
+        return [path.name.replace(station, "", 1) for path in date_dirs]
+
     inferred = set()
     for path in needed:
         match = re.search(rf"{re.escape(station)}(\d{{8}})", str(path))
@@ -196,9 +200,6 @@ def main() -> int:
     needed, status_counts, failed_rows = read_manifest_sources(args.manifest)
     progress.update("Reading manifest", 1, 1, force=True)
     dates = infer_dates(args.audio_root, args.station, args.dates, needed)
-    if not dates:
-        date_dirs = sorted(args.audio_root.glob(f"{args.station}[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]"))
-        dates = [path.name.replace(args.station, "", 1) for path in date_dirs]
 
     ffprobe_available = shutil.which(args.ffprobe) is not None
     do_ffprobe = (not args.skip_ffprobe) and ffprobe_available
