@@ -786,7 +786,7 @@ def main() -> int:
                             "invalid_signal": str(raw_invalid or ""),
                             "decode_status": "",
                             "status": "skipped",
-                            "message": "empty_or_unknown_label",
+                            "message": "unknown_or_unresolved_signal",
                         }
                     )
                     progress.update(processed, written, skipped, failed)
