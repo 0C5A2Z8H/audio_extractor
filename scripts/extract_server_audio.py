@@ -624,13 +624,13 @@ class ProgressReporter:
         else:
             message = f"\rExtracting processed={processed} {stats}"
 
-        sys.stderr.write(message[:180].ljust(180))
-        sys.stderr.flush()
+        sys.stdout.write("\r\x1b[K" + message.lstrip("\r")[:180])
+        sys.stdout.flush()
 
     def finish(self) -> None:
         if self.enabled:
-            sys.stderr.write("\n")
-            sys.stderr.flush()
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
 
 def format_duration(seconds: float) -> str:
