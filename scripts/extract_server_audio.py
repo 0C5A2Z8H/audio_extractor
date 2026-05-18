@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Extract labelled satellite audio clips from hourly server recordings.
+r"""从服务器小时级录音中提取带标注的卫星音频片段。
 
-Expected server layout:
+服务器录音目录通常如下：
 
     D:\AudioRecord\LX20260407\LX20260407-010000.m4a
 
-The script reads an annotation workbook, takes start/end timestamps and a label
-column, cuts the matching ranges from hourly recordings with ffmpeg, decodes them
-to WAV, and writes a manifest for reproducibility.
+脚本读取 Excel 标注表，使用起始时间、结束时间和类别列定位真实录音覆盖区间，
+再调用 ffmpeg 切割并解码为 WAV，同时写出 manifest 以便后续追溯。
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ SOURCE_NAME_RE = re.compile(r"^(?P<station>[A-Za-z]+)(?P<day>\d{8})-(?P<clock>\d
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Cut labelled clips from hourly satellite audio recordings."
+        description="从小时级卫星录音中切割带标注的音频片段。"
     )
     parser.add_argument("--audio-root", type=Path, default=Path.cwd())
     parser.add_argument("--excel", type=Path, required=True)
@@ -42,16 +41,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sheet", default=None, help="Worksheet name. Defaults to active sheet.")
     parser.add_argument("--station", default="LX")
     parser.add_argument("--source-ext", default="m4a")
-    parser.add_argument("--start-col", default="B")
-    parser.add_argument("--end-col", default="C")
-    parser.add_argument("--label-col", default="AK")
+    parser.add_argument("--start-col", default="F")
+    parser.add_argument("--end-col", default="G")
+    parser.add_argument("--label-col", default="T")
+    parser.add_argument("--invalid-col", default="N")
+    parser.add_argument("--invalid-marker", default="无效信号")
+    parser.add_argument("--include-invalid-signals", action="store_true")
     parser.add_argument("--first-data-row", type=int, default=2)
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument(
         "--clear-output-root",
         action="store_true",
-        help="Delete existing files under --output-root before extraction. Ignored in --dry-run.",
+        help="Delete existing files under --output-root before extraction. This is now the default for real runs.",
     )
+    parser.add_argument("--keep-output-root", action="store_true", help="Do not clear --output-root before extraction.")
     parser.add_argument("--manifest", type=Path, default=None)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
@@ -118,6 +121,24 @@ def column_index(column: str) -> int:
     return result
 
 
+def column_letter(index: int) -> str:
+    letters = []
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        letters.append(chr(ord("A") + remainder))
+    return "".join(reversed(letters))
+
+
+def normalize_cell_text(value) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip()).lower()
+
+
+def row_value(row: tuple[object, ...], index: int | None):
+    if index is None or len(row) < index:
+        return None
+    return row[index - 1]
+
+
 def parse_excel_datetime(value) -> dt.datetime | None:
     if value is None or value == "":
         return None
@@ -147,6 +168,8 @@ def parse_excel_datetime(value) -> dt.datetime | None:
         "%Y/%m/%d %H:%M",
         "%Y-%m-%d %H:%M",
         "%Y%m%d %H:%M:%S",
+        "%Y%m%d-%H%M%S",
+        "%Y%m%d-%H%M",
     )
     for fmt in formats:
         try:
@@ -590,21 +613,16 @@ class ProgressReporter:
         self.last_update = now
 
         elapsed = now - self.started_at
-        stats = f"ok={written} skipped={skipped} failed={failed} elapsed={format_duration(elapsed)}"
-        detail = ""
-        if row_index is not None:
-            detail = f" row={row_index}"
-        if label:
-            detail += f" label={shorten(label, 24)}"
+        stats = f"elapsed={format_duration(elapsed)} ok={written} skipped={skipped} failed={failed}"
 
         if self.total:
             ratio = min(processed / self.total, 1.0)
             width = 30
             filled = int(width * ratio)
             bar = "#" * filled + "-" * (width - filled)
-            message = f"\r[{bar}] {processed}/{self.total} {ratio * 100:5.1f}% {stats}{detail}"
+            message = f"\rExtracting [{bar}] {processed}/{self.total} {ratio * 100:5.1f}% {stats}"
         else:
-            message = f"\rprocessed={processed} {stats}{detail}"
+            message = f"\rExtracting processed={processed} {stats}"
 
         sys.stderr.write(message[:180].ljust(180))
         sys.stderr.flush()
@@ -658,9 +676,10 @@ def main() -> int:
     if args.source_match_mode == "coverage" and not shutil.which(args.ffprobe):
         raise SystemExit(f"ffprobe not found: {args.ffprobe}")
 
-    if args.clear_output_root:
+    should_clear_output = (not args.keep_output_root) or args.clear_output_root
+    if should_clear_output:
         if args.dry_run:
-            print("--clear-output-root ignored because --dry-run is set.")
+            print("output-root cleanup skipped because --dry-run is set.")
         else:
             safe_clear_output_root(args.output_root, args.audio_root)
 
@@ -670,6 +689,13 @@ def main() -> int:
     start_idx = column_index(args.start_col)
     end_idx = column_index(args.end_col)
     label_idx = column_index(args.label_col)
+    invalid_idx = None if args.invalid_col.lower() in {"", "none"} else column_index(args.invalid_col)
+    print(
+        "Resolved columns: "
+        f"start={column_letter(start_idx)}, end={column_letter(end_idx)}, "
+        f"label={column_letter(label_idx)}, "
+        f"invalid={column_letter(invalid_idx) if invalid_idx else 'none'}"
+    )
 
     args.manifest.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -681,6 +707,7 @@ def main() -> int:
         "duration_sec",
         "output_path",
         "source_files",
+        "invalid_signal",
         "decode_status",
         "status",
         "message",
@@ -710,7 +737,9 @@ def main() -> int:
                     break
                 processed += 1
 
-                raw_label = row[label_idx - 1] if len(row) >= label_idx else None
+                raw_invalid = row_value(row, invalid_idx)
+                invalid_signal = normalize_cell_text(raw_invalid) == normalize_cell_text(args.invalid_marker)
+                raw_label = row_value(row, label_idx)
                 label = sanitize_label(raw_label)
                 progress.update(
                     processed,
@@ -721,6 +750,27 @@ def main() -> int:
                     label=label,
                     force=True,
                 )
+                if invalid_signal and not args.include_invalid_signals:
+                    skipped += 1
+                    writer.writerow(
+                        {
+                            "row_index": row_index,
+                            "sample_id": "",
+                            "label": str(raw_label or ""),
+                            "start_time": "",
+                            "end_time": "",
+                            "duration_sec": "",
+                            "output_path": "",
+                            "source_files": "",
+                            "invalid_signal": str(raw_invalid or ""),
+                            "decode_status": "",
+                            "status": "skipped",
+                            "message": "invalid_signal",
+                        }
+                    )
+                    progress.update(processed, written, skipped, failed)
+                    continue
+
                 if not label or label in {"?", "？"}:
                     skipped += 1
                     writer.writerow(
@@ -733,6 +783,7 @@ def main() -> int:
                             "duration_sec": "",
                             "output_path": "",
                             "source_files": "",
+                            "invalid_signal": str(raw_invalid or ""),
                             "decode_status": "",
                             "status": "skipped",
                             "message": "empty_or_unknown_label",
@@ -742,8 +793,8 @@ def main() -> int:
                     continue
 
                 try:
-                    raw_start = row[start_idx - 1] if len(row) >= start_idx else None
-                    raw_end = row[end_idx - 1] if len(row) >= end_idx else None
+                    raw_start = row_value(row, start_idx)
+                    raw_end = row_value(row, end_idx)
                     start = parse_excel_datetime(raw_start)
                     end = parse_excel_datetime(raw_end)
                     if start is None or end is None:
@@ -768,6 +819,7 @@ def main() -> int:
                             "duration_sec": f"{duration_sec:.3f}",
                             "output_path": str(output_path),
                             "source_files": ";".join(str(path) for path in sources),
+                            "invalid_signal": str(raw_invalid or ""),
                             "decode_status": decode_status,
                             "status": "dry_run" if args.dry_run else "ok",
                             "message": "",
@@ -785,6 +837,7 @@ def main() -> int:
                             "duration_sec": "",
                             "output_path": "",
                             "source_files": "",
+                            "invalid_signal": str(raw_invalid or ""),
                             "decode_status": "",
                             "status": "failed",
                             "message": str(exc),

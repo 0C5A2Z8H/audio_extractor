@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect server-side AudioRecord files and compare them with a manifest."""
+"""检查服务器 AudioRecord 录音库存，并可与 manifest 中的来源文件需求对比。"""
 
 from __future__ import annotations
 
@@ -23,11 +23,11 @@ COMMAND_INPUT_RE = re.compile(r"\s-i\s+([A-Za-z]:\\.*?\.m4a)\s+-ss\s+")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Inspect D:\\AudioRecord and summarize files needed by extraction_manifest.csv."
+        description="检查 D:\\AudioRecord 录音库存，并汇总 extraction_manifest.csv 需要的来源文件。"
     )
     parser.add_argument("--audio-root", type=Path, default=Path(r"D:\AudioRecord"))
     parser.add_argument("--manifest", type=Path, default=None)
-    parser.add_argument("--output-dir", type=Path, default=Path(r"D:\audio_extractor\server_inspection"))
+    parser.add_argument("--output-dir", type=Path, default=Path("reports/server_inspection"))
     parser.add_argument("--station", default="LX")
     parser.add_argument("--source-ext", default="m4a")
     parser.add_argument("--dates", nargs="*", default=None, help="YYYYMMDD dates to inspect.")

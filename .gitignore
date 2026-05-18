@@ -25,10 +25,11 @@ conda-meta/
 *.swo
 *~
 
-# Local notes and source materials
+# Local notes, reports, and retired scratch/source dumps.
 background/
 docs/
 prompt/
+reports/
 
 # OS files
 .DS_Store
@@ -44,11 +45,10 @@ temp/
 
 # Generated datasets and manifests
 SatelliteAudio/
-data/
 datasets/
 outputs/
 artifacts/
-server_inspection/
+/server_inspection/
 extraction_manifest.csv
 *_manifest.csv
 
@@ -72,3 +72,9 @@ mlruns/
 *.pt
 *.pth
 *.onnx
+
+# Data defaults: keep large/generated data out of Git, but track Excel annotations
+# because extraction scripts depend on them.
+data/*
+!data/annotations/
+!data/annotations/**
