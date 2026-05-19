@@ -154,6 +154,7 @@ class ProgressReporter:
         self.stage = stage
         self.last_update = 0.0
         self.started_at = time.monotonic()
+        self.last_message_len = 0
 
     def update(self, current: int, force: bool = False) -> None:
         if not self.enabled:
@@ -171,8 +172,11 @@ class ProgressReporter:
             message = f"\r{self.stage} [{bar}] {current}/{self.total} {ratio * 100:5.1f}% elapsed={elapsed}"
         else:
             message = f"\r{self.stage} processed={current} elapsed={elapsed}"
-        sys.stdout.write("\r\x1b[K" + message.lstrip("\r")[:180])
+        message = message.lstrip("\r")[:180]
+        padding = " " * max(self.last_message_len - len(message), 0)
+        sys.stdout.write("\r" + message + padding)
         sys.stdout.flush()
+        self.last_message_len = len(message)
 
     def finish(self) -> None:
         if self.enabled:
@@ -234,7 +238,7 @@ def raise_csv_field_limit() -> None:
 
 def read_annotation_rows(args: argparse.Namespace) -> tuple[list[dict[str, object]], dict[str, int], dict[str, int], str]:
     if not args.no_progress:
-        sys.stdout.write("\r\x1b[KLoading Excel annotations...")
+        sys.stdout.write("\rLoading Excel annotations...")
         sys.stdout.flush()
     workbook = load_workbook(args.excel, args.password)
     worksheet = workbook[args.sheet] if args.sheet else workbook.active
@@ -501,7 +505,7 @@ def generate_row_report(args: argparse.Namespace, annotation_rows: list[dict[str
     if not inventory_path.exists():
         return [], {}
     if not args.no_progress:
-        sys.stdout.write("\r\x1b[KLoading Excel annotations for coverage check...")
+        sys.stdout.write("\rLoading Excel annotations for coverage check...")
         sys.stdout.flush()
     workbook = load_workbook(args.excel, args.password)
     worksheet = workbook[args.sheet] if args.sheet else workbook.active

@@ -594,6 +594,7 @@ class ProgressReporter:
         self.interval_sec = max(interval_sec, 0.0)
         self.last_update = 0.0
         self.started_at = time.monotonic()
+        self.last_message_len = 0
 
     def update(
         self,
@@ -624,8 +625,11 @@ class ProgressReporter:
         else:
             message = f"\rExtracting processed={processed} {stats}"
 
-        sys.stdout.write("\r\x1b[K" + message.lstrip("\r")[:180])
+        message = message.lstrip("\r")[:180]
+        padding = " " * max(self.last_message_len - len(message), 0)
+        sys.stdout.write("\r" + message + padding)
         sys.stdout.flush()
+        self.last_message_len = len(message)
 
     def finish(self) -> None:
         if self.enabled:
