@@ -6,3 +6,4 @@ dependencies:
   - ffmpeg
   - openpyxl
   - msoffcrypto-tool
+  - tqdm

@@ -22,7 +22,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from typing import Iterable
 
@@ -591,10 +590,31 @@ class ProgressReporter:
     def __init__(self, enabled: bool, total: int | None, interval_sec: float) -> None:
         self.enabled = enabled
         self.total = total if total and total > 0 else None
-        self.interval_sec = max(interval_sec, 0.0)
-        self.last_update = 0.0
-        self.started_at = time.monotonic()
-        self.last_message_len = 0
+        self.current = 0
+        self.bar = None
+        if not enabled:
+            return
+        try:
+            from tqdm import tqdm
+        except ImportError:
+            print("Extracting: progress disabled because tqdm is not installed.", flush=True)
+            self.enabled = False
+            return
+        if self.total:
+            bar_format = "{desc:<18} [{bar}] {n_fmt}/{total_fmt} {percentage:5.1f}% elapsed={elapsed} {postfix}"
+        else:
+            bar_format = "{desc:<18} {n_fmt} elapsed={elapsed} {postfix}"
+        self.bar = tqdm(
+            total=self.total,
+            desc="Extracting",
+            ascii=True,
+            dynamic_ncols=False,
+            ncols=96,
+            mininterval=max(interval_sec, 0.1),
+            file=sys.stdout,
+            leave=True,
+            bar_format=bar_format,
+        )
 
     def update(
         self,
@@ -606,35 +626,19 @@ class ProgressReporter:
         label: str | None = None,
         force: bool = False,
     ) -> None:
-        if not self.enabled:
+        if not self.enabled or self.bar is None:
             return
-        now = time.monotonic()
-        if not force and now - self.last_update < self.interval_sec:
-            return
-        self.last_update = now
-
-        elapsed = now - self.started_at
-        stats = f"elapsed={format_duration(elapsed)} ok={written} skipped={skipped} failed={failed}"
-
-        if self.total:
-            ratio = min(processed / self.total, 1.0)
-            width = 30
-            filled = int(width * ratio)
-            bar = "#" * filled + "-" * (width - filled)
-            message = f"\rExtracting [{bar}] {processed}/{self.total} {ratio * 100:5.1f}% {stats}"
-        else:
-            message = f"\rExtracting processed={processed} {stats}"
-
-        message = message.lstrip("\r")[:180]
-        padding = " " * max(self.last_message_len - len(message), 0)
-        sys.stdout.write("\r" + message + padding)
-        sys.stdout.flush()
-        self.last_message_len = len(message)
+        self.bar.set_postfix_str(f"ok={written} skipped={skipped} failed={failed}", refresh=False)
+        delta = processed - self.current
+        if delta > 0:
+            self.bar.update(delta)
+            self.current = processed
+        elif force:
+            self.bar.refresh()
 
     def finish(self) -> None:
-        if self.enabled:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+        if self.enabled and self.bar is not None:
+            self.bar.close()
 
 
 def format_duration(seconds: float) -> str:

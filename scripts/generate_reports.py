@@ -3,7 +3,7 @@ r"""统一生成数据集构建前后的中文检查报告。
 
 默认围绕当前 Git 追踪的新版 Excel 标注表工作：
 
-    data\annotations\260311-260430.LX事件.lgm已核实.xlsx
+    data\annotations\260311-260430.LX事件(2).xlsx
 
 报告输出到 reports/，包括标注质量、服务器录音库存、行级覆盖率和数据集类别统计。
 """
@@ -19,12 +19,11 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
 
-DEFAULT_EXCEL = Path(r"data\annotations\260311-260430.LX事件.lgm已核实.xlsx")
+DEFAULT_EXCEL = Path(r"data\annotations\260311-260430.LX事件(2).xlsx")
 SOURCE_RE = re.compile(r"([A-Za-z]+)(\d{8})-(\d{6})\.(\w+)$")
 AUDIO_EXTS = {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg"}
 
@@ -150,38 +149,46 @@ class ProgressReporter:
     def __init__(self, enabled: bool, total: int | None, interval_sec: float, stage: str) -> None:
         self.enabled = enabled
         self.total = total if total and total > 0 else None
-        self.interval_sec = max(interval_sec, 0.0)
         self.stage = stage
-        self.last_update = 0.0
-        self.started_at = time.monotonic()
-        self.last_message_len = 0
+        self.current = 0
+        self.bar = None
+        if not enabled:
+            return
+        try:
+            from tqdm import tqdm
+        except ImportError:
+            print(f"{stage}: progress disabled because tqdm is not installed.", flush=True)
+            self.enabled = False
+            return
+        if self.total:
+            bar_format = "{desc:<18} [{bar}] {n_fmt}/{total_fmt} {percentage:5.1f}% elapsed={elapsed}"
+        else:
+            bar_format = "{desc:<18} {n_fmt} elapsed={elapsed}"
+        self.bar = tqdm(
+            total=self.total,
+            desc=stage,
+            ascii=True,
+            dynamic_ncols=False,
+            ncols=80,
+            mininterval=max(interval_sec, 0.1),
+            file=sys.stdout,
+            leave=True,
+            bar_format=bar_format,
+        )
 
     def update(self, current: int, force: bool = False) -> None:
-        if not self.enabled:
+        if not self.enabled or self.bar is None:
             return
-        now = time.monotonic()
-        if not force and now - self.last_update < self.interval_sec:
-            return
-        self.last_update = now
-        elapsed = format_duration(now - self.started_at)
-        if self.total:
-            ratio = min(current / self.total, 1.0)
-            width = 30
-            filled = int(width * ratio)
-            bar = "#" * filled + "-" * (width - filled)
-            message = f"\r{self.stage} [{bar}] {current}/{self.total} {ratio * 100:5.1f}% elapsed={elapsed}"
-        else:
-            message = f"\r{self.stage} processed={current} elapsed={elapsed}"
-        message = message.lstrip("\r")[:180]
-        padding = " " * max(self.last_message_len - len(message), 0)
-        sys.stdout.write("\r" + message + padding)
-        sys.stdout.flush()
-        self.last_message_len = len(message)
+        delta = current - self.current
+        if delta > 0:
+            self.bar.update(delta)
+            self.current = current
+        elif force:
+            self.bar.refresh()
 
     def finish(self) -> None:
-        if self.enabled:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+        if self.enabled and self.bar is not None:
+            self.bar.close()
 
 
 def format_duration(seconds: float) -> str:
@@ -238,8 +245,7 @@ def raise_csv_field_limit() -> None:
 
 def read_annotation_rows(args: argparse.Namespace) -> tuple[list[dict[str, object]], dict[str, int], dict[str, int], str]:
     if not args.no_progress:
-        sys.stdout.write("\rLoading Excel annotations...")
-        sys.stdout.flush()
+        print("Loading Excel annotations...", flush=True)
     workbook = load_workbook(args.excel, args.password)
     worksheet = workbook[args.sheet] if args.sheet else workbook.active
     start_idx = column_index(args.start_col)
@@ -505,8 +511,7 @@ def generate_row_report(args: argparse.Namespace, annotation_rows: list[dict[str
     if not inventory_path.exists():
         return [], {}
     if not args.no_progress:
-        sys.stdout.write("\rLoading Excel annotations for coverage check...")
-        sys.stdout.flush()
+        print("Loading Excel annotations for coverage check...", flush=True)
     workbook = load_workbook(args.excel, args.password)
     worksheet = workbook[args.sheet] if args.sheet else workbook.active
     intervals = read_inventory(inventory_path)
@@ -529,8 +534,13 @@ def generate_row_report(args: argparse.Namespace, annotation_rows: list[dict[str
                 continue
             processed += 1
             progress.update(processed)
+            raw_start = row_value(row, start_idx)
+            raw_end = row_value(row, end_idx)
             label = str(row_value(row, label_idx) or "").strip()
             invalid_raw = row_value(row, invalid_idx)
+            has_any_key_value = any(value not in (None, "") for value in (raw_start, raw_end, label, invalid_raw))
+            if not has_any_key_value:
+                continue
             invalid_signal = normalize_cell_text(invalid_raw) == marker_text
             unknown_signal = not label or label in {"?", "？"}
             if invalid_signal:
@@ -578,8 +588,8 @@ def generate_row_report(args: argparse.Namespace, annotation_rows: list[dict[str
                 )
                 continue
             try:
-                start = parse_excel_datetime(row_value(row, start_idx))
-                end = parse_excel_datetime(row_value(row, end_idx))
+                start = parse_excel_datetime(raw_start)
+                end = parse_excel_datetime(raw_end)
                 if start is None or end is None or end <= start:
                     status = "invalid_time"
                     message = "起止时间缺失或结束时间不晚于起始时间"
