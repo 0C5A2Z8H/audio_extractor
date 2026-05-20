@@ -28,6 +28,7 @@ from typing import Iterable
 
 INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 SOURCE_NAME_RE = re.compile(r"^(?P<station>[A-Za-z]+)(?P<day>\d{8})-(?P<clock>\d{6})\.(?P<ext>\w+)$")
+DEFAULT_ANNOTATION_DIR = Path(r"data\annotations")
 
 
 def parse_args() -> argparse.Namespace:
@@ -35,7 +36,7 @@ def parse_args() -> argparse.Namespace:
         description="从小时级卫星录音中切割带标注的音频片段。"
     )
     parser.add_argument("--audio-root", type=Path, default=Path.cwd())
-    parser.add_argument("--excel", type=Path, required=True)
+    parser.add_argument("--excel", type=Path, default=None)
     parser.add_argument("--password", default=None)
     parser.add_argument("--sheet", default=None, help="Worksheet name. Defaults to active sheet.")
     parser.add_argument("--station", default="LX")
@@ -78,6 +79,26 @@ def parse_args() -> argparse.Namespace:
         help="Minimum seconds between progress bar refreshes.",
     )
     return parser.parse_args()
+
+
+def discover_annotation_excel(annotation_dir: Path = DEFAULT_ANNOTATION_DIR) -> Path:
+    if not annotation_dir.exists():
+        raise SystemExit(f"Annotation directory not found: {annotation_dir}")
+    candidates = sorted(
+        path
+        for path in annotation_dir.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in {".xlsx", ".xlsm"}
+        and not path.name.startswith("~$")
+    )
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise SystemExit(f"No annotation Excel file found in {annotation_dir}.")
+    names = "\n".join(f"  - {path}" for path in candidates)
+    raise SystemExit(
+        f"Multiple annotation Excel files found in {annotation_dir}; keep only one or pass --excel explicitly:\n{names}"
+    )
 
 
 def load_workbook(path: Path, password: str | None):
@@ -669,6 +690,8 @@ def estimate_total_rows(worksheet, first_data_row: int, limit: int | None) -> in
 def main() -> int:
     args = parse_args()
     args.audio_root = args.audio_root.resolve()
+    if args.excel is None:
+        args.excel = discover_annotation_excel()
     args.excel = args.excel.resolve()
     if args.output_root:
         args.output_root = args.output_root.resolve()

@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 r"""统一生成数据集构建前后的中文检查报告。
 
-默认围绕当前 Git 追踪的新版 Excel 标注表工作：
-
-    data\annotations\260311-260430.LX事件(2).xlsx
+默认自动使用 data\annotations\ 下唯一的正式 Excel 标注表。
 
 报告输出到 reports/，包括标注质量、服务器录音库存、行级覆盖率和数据集类别统计。
 """
@@ -23,9 +21,9 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 
-DEFAULT_EXCEL = Path(r"data\annotations\260311-260430.LX事件(2).xlsx")
+DEFAULT_ANNOTATION_DIR = Path(r"data\annotations")
 SOURCE_RE = re.compile(r"([A-Za-z]+)(\d{8})-(\d{6})\.(\w+)$")
-AUDIO_EXTS = {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg"}
+UNRECORDED_CENTER_FREQ_REASON = "中频 5400 不会录到有效信号"
 
 ANNOTATION_STATUS_ZH = {
     "ready_for_extraction": "可提取",
@@ -46,12 +44,10 @@ COVERAGE_STATUS_ZH = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="一键生成标注、录音覆盖和数据集统计报告。")
-    parser.add_argument("--excel", type=Path, default=DEFAULT_EXCEL)
+    parser.add_argument("--excel", type=Path, default=None)
     parser.add_argument("--password", default=None)
     parser.add_argument("--sheet", default=None)
     parser.add_argument("--audio-root", type=Path, default=Path(r"D:\AudioRecord"))
-    parser.add_argument("--manifest", type=Path, default=Path(r"D:\SatelliteAudio\extraction_manifest.csv"))
-    parser.add_argument("--raw-root", type=Path, default=Path(r"D:\SatelliteAudio\raw"))
     parser.add_argument("--output-dir", type=Path, default=Path("reports"))
     parser.add_argument("--clear-output-dir", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--station", default="LX")
@@ -59,17 +55,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-col", default="F")
     parser.add_argument("--end-col", default="G")
     parser.add_argument("--label-col", default="T")
+    parser.add_argument("--center-freq-col", default="B")
     parser.add_argument("--invalid-col", default="N")
     parser.add_argument("--invalid-marker", default="无效信号")
+    parser.add_argument("--unrecorded-center-freq", type=float, default=5400.0)
     parser.add_argument("--first-data-row", type=int, default=2)
     parser.add_argument("--ignore-dates", nargs="*", default=[])
     parser.add_argument("--use-existing-inventory", action="store_true")
-    parser.add_argument("--skip-dataset-counts", action="store_true")
     parser.add_argument("--ffprobe", default="ffprobe")
     parser.add_argument("--skip-ffprobe", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--progress-interval-sec", type=float, default=0.2)
     return parser.parse_args()
+
+
+def discover_annotation_excel(annotation_dir: Path = DEFAULT_ANNOTATION_DIR) -> Path:
+    if not annotation_dir.exists():
+        raise SystemExit(f"Annotation directory not found: {annotation_dir}")
+    candidates = sorted(
+        path
+        for path in annotation_dir.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in {".xlsx", ".xlsm"}
+        and not path.name.startswith("~$")
+    )
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise SystemExit(f"No annotation Excel file found in {annotation_dir}.")
+    names = "\n".join(f"  - {path}" for path in candidates)
+    raise SystemExit(
+        f"Multiple annotation Excel files found in {annotation_dir}; keep only one or pass --excel explicitly:\n{names}"
+    )
 
 
 def column_index(column: str) -> int:
@@ -89,6 +106,24 @@ def row_value(row: tuple[object, ...], index: int | None):
 
 def normalize_cell_text(value) -> str:
     return re.sub(r"\s+", "", str(value or "").strip()).lower()
+
+
+def normalize_label_text(value) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def parse_float(value) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_unrecorded_center_freq(value, target: float) -> bool:
+    parsed = parse_float(value)
+    return parsed is not None and abs(parsed - target) < 1e-6
 
 
 def parse_excel_datetime(value) -> dt.datetime | None:
@@ -251,6 +286,7 @@ def read_annotation_rows(args: argparse.Namespace) -> tuple[list[dict[str, objec
     start_idx = column_index(args.start_col)
     end_idx = column_index(args.end_col)
     label_idx = column_index(args.label_col)
+    center_freq_idx = column_index(args.center_freq_col)
     invalid_idx = None if args.invalid_col.lower() in {"", "none"} else column_index(args.invalid_col)
     marker_text = normalize_cell_text(args.invalid_marker)
 
@@ -271,8 +307,9 @@ def read_annotation_rows(args: argparse.Namespace) -> tuple[list[dict[str, objec
             raw_start = row_value(row, start_idx)
             raw_end = row_value(row, end_idx)
             label = str(row_value(row, label_idx) or "").strip()
+            center_freq = row_value(row, center_freq_idx)
             invalid_value = str(row_value(row, invalid_idx) or "").strip()
-            has_any_key_value = any(value not in (None, "") for value in (raw_start, raw_end, label, invalid_value))
+            has_any_key_value = any(value not in (None, "") for value in (raw_start, raw_end, label, center_freq, invalid_value))
             if not has_any_key_value:
                 continue
 
@@ -315,6 +352,7 @@ def read_annotation_rows(args: argparse.Namespace) -> tuple[list[dict[str, objec
                 {
                     "row_index": row_index,
                     "label": label,
+                    "center_freq_mhz": center_freq,
                     "invalid_signal": invalid_value,
                     "start_raw": raw_start,
                     "end_raw": raw_end,
@@ -495,12 +533,15 @@ def format_problem_row(row: dict[str, object]) -> str:
         f"卫星/类别: {row.get('label', '')}",
         f"状态: {row.get('coverage_status_zh', row.get('coverage_status', ''))}",
     ]
+    if row.get("center_freq_mhz") not in (None, ""):
+        detail_parts.append(f"中频: {row.get('center_freq_mhz')}")
     if row.get("start_time") or row.get("end_time"):
         detail_parts.append(f"时间: {row.get('start_time', '')} -> {row.get('end_time', '')}")
     if row.get("coverage_ratio"):
         detail_parts.append(f"覆盖比例: {row.get('coverage_ratio')}")
-    if row.get("message"):
-        detail_parts.append(f"原因: {row.get('message')}")
+    reason = row.get("not_extractable_reason") or row.get("message")
+    if reason:
+        detail_parts.append(f"原因: {reason}")
     if row.get("source_files"):
         detail_parts.append(f"涉及源文件: {row.get('source_files')}")
     return "；".join(detail_parts)
@@ -519,6 +560,7 @@ def generate_row_report(args: argparse.Namespace, annotation_rows: list[dict[str
     start_idx = column_index(args.start_col)
     end_idx = column_index(args.end_col)
     label_idx = column_index(args.label_col)
+    center_freq_idx = column_index(args.center_freq_col)
     invalid_idx = None if args.invalid_col.lower() in {"", "none"} else column_index(args.invalid_col)
     marker_text = normalize_cell_text(args.invalid_marker)
 
@@ -537,34 +579,15 @@ def generate_row_report(args: argparse.Namespace, annotation_rows: list[dict[str
             raw_start = row_value(row, start_idx)
             raw_end = row_value(row, end_idx)
             label = str(row_value(row, label_idx) or "").strip()
+            center_freq_raw = row_value(row, center_freq_idx)
+            center_freq_text = "" if center_freq_raw in (None, "") else str(center_freq_raw).strip()
             invalid_raw = row_value(row, invalid_idx)
-            has_any_key_value = any(value not in (None, "") for value in (raw_start, raw_end, label, invalid_raw))
+            has_any_key_value = any(value not in (None, "") for value in (raw_start, raw_end, label, center_freq_raw, invalid_raw))
             if not has_any_key_value:
                 continue
-            invalid_signal = normalize_cell_text(invalid_raw) == marker_text
+            problem_label = normalize_cell_text(invalid_raw) == marker_text
+            unrecorded_center_freq = is_unrecorded_center_freq(center_freq_raw, args.unrecorded_center_freq)
             unknown_signal = not label or label in {"?", "？"}
-            if invalid_signal:
-                status = "invalid_signal"
-                counts[status] = counts.get(status, 0) + 1
-                rows.append(
-                    {
-                        "row_index": row_index,
-                        "label": label,
-                        "invalid_signal": str(invalid_raw or ""),
-                        "start_time": "",
-                        "end_time": "",
-                        "duration_sec": "",
-                        "annotation_status": "invalid_signal",
-                        "annotation_status_zh": ANNOTATION_STATUS_ZH["invalid_signal"],
-                        "coverage_status": status,
-                        "coverage_status_zh": COVERAGE_STATUS_ZH[status],
-                        "final_category": "已标注无效信号",
-                        "coverage_ratio": "0.000000",
-                        "message": "已标注为无效信号",
-                        "source_files": "",
-                    }
-                )
-                continue
             if unknown_signal:
                 status = "unknown_signal"
                 counts[status] = counts.get(status, 0) + 1
@@ -572,15 +595,20 @@ def generate_row_report(args: argparse.Namespace, annotation_rows: list[dict[str
                     {
                         "row_index": row_index,
                         "label": label,
+                        "center_freq_mhz": center_freq_text,
                         "invalid_signal": str(invalid_raw or ""),
                         "start_time": "",
                         "end_time": "",
                         "duration_sec": "",
                         "annotation_status": "unknown_signal",
                         "annotation_status_zh": ANNOTATION_STATUS_ZH["unknown_signal"],
+                        "problem_label": "是" if problem_label else "否",
+                        "objective_extractable": "",
                         "coverage_status": "",
                         "coverage_status_zh": "",
-                        "final_category": "未知/未分辨信号",
+                        "final_category": "未参与判断",
+                        "label_match_status": "未参与判断",
+                        "not_extractable_reason": "未参与判断",
                         "coverage_ratio": "",
                         "message": "推测卫星为空或问号，按未知/未分辨信号跳过",
                         "source_files": "",
@@ -604,19 +632,47 @@ def generate_row_report(args: argparse.Namespace, annotation_rows: list[dict[str
                     parts = coverage_parts(start, end, intervals)
                     status, message, ratio = classify_coverage(start, end, parts)
                 counts[status] = counts.get(status, 0) + 1
+                objective_extractable = status == "fully_covered" and not unrecorded_center_freq
+                if status == "invalid_time":
+                    not_extractable_reason = "起止时间无效"
+                elif unrecorded_center_freq:
+                    not_extractable_reason = UNRECORDED_CENTER_FREQ_REASON
+                elif status == "no_coverage":
+                    not_extractable_reason = "无录音覆盖"
+                elif status == "partial_coverage":
+                    not_extractable_reason = "录音部分覆盖"
+                elif status == "ignored_deleted_date":
+                    not_extractable_reason = "已排除日期"
+                elif objective_extractable:
+                    not_extractable_reason = ""
+                else:
+                    not_extractable_reason = COVERAGE_STATUS_ZH.get(status, status)
+                if objective_extractable and problem_label:
+                    label_match_status = "可提取但被标问题信号"
+                elif (not objective_extractable) and problem_label:
+                    label_match_status = "不可提取且已标问题信号"
+                elif (not objective_extractable) and not problem_label:
+                    label_match_status = "不可提取但未标问题信号"
+                else:
+                    label_match_status = "可提取且未标问题信号"
                 rows.append(
                     {
                         "row_index": row_index,
                         "label": label,
+                        "center_freq_mhz": center_freq_text,
                         "invalid_signal": str(invalid_raw or ""),
                         "start_time": start.isoformat(sep=" ") if start else "",
                         "end_time": end.isoformat(sep=" ") if end else "",
                         "duration_sec": f"{(end - start).total_seconds():.3f}" if start and end and end > start else "",
-                        "annotation_status": "ready_for_extraction" if status == "fully_covered" else status,
-                        "annotation_status_zh": "可提取" if status == "fully_covered" else COVERAGE_STATUS_ZH.get(status, status),
+                        "annotation_status": "invalid_signal" if problem_label else "ready_for_extraction",
+                        "annotation_status_zh": "人工标注为问题信号" if problem_label else "未标问题信号",
+                        "problem_label": "是" if problem_label else "否",
+                        "objective_extractable": "是" if objective_extractable else "否",
                         "coverage_status": status,
                         "coverage_status_zh": COVERAGE_STATUS_ZH.get(status, status),
-                        "final_category": "可提取" if status == "fully_covered" else "问题信号",
+                        "final_category": "可提取" if objective_extractable else "不可提取",
+                        "label_match_status": label_match_status,
+                        "not_extractable_reason": not_extractable_reason,
                         "coverage_ratio": f"{ratio:.6f}",
                         "message": message,
                         "source_files": ";".join(str(part["path"]) for part in parts),
@@ -629,15 +685,20 @@ def generate_row_report(args: argparse.Namespace, annotation_rows: list[dict[str
                     {
                         "row_index": row_index,
                         "label": label,
+                        "center_freq_mhz": center_freq_text,
                         "invalid_signal": str(invalid_raw or ""),
                         "start_time": "",
                         "end_time": "",
                         "duration_sec": "",
                         "annotation_status": status,
                         "annotation_status_zh": COVERAGE_STATUS_ZH[status],
+                        "problem_label": "是" if problem_label else "否",
+                        "objective_extractable": "否",
                         "coverage_status": status,
                         "coverage_status_zh": COVERAGE_STATUS_ZH[status],
-                        "final_category": "问题信号",
+                        "final_category": "不可提取",
+                        "label_match_status": "不可提取且已标问题信号" if problem_label else "不可提取但未标问题信号",
+                        "not_extractable_reason": "检查出错",
                         "coverage_ratio": "0.000000",
                         "message": str(exc),
                         "source_files": "",
@@ -653,15 +714,20 @@ def generate_row_report(args: argparse.Namespace, annotation_rows: list[dict[str
         [
             "row_index",
             "label",
+            "center_freq_mhz",
             "invalid_signal",
             "start_time",
             "end_time",
             "duration_sec",
             "annotation_status",
             "annotation_status_zh",
+            "problem_label",
+            "objective_extractable",
             "coverage_status",
             "coverage_status_zh",
             "final_category",
+            "label_match_status",
+            "not_extractable_reason",
             "coverage_ratio",
             "message",
             "source_files",
@@ -670,93 +736,55 @@ def generate_row_report(args: argparse.Namespace, annotation_rows: list[dict[str
     return rows, counts
 
 
-def manifest_data_row_count(manifest: Path) -> int:
-    with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
-        return max(sum(1 for _ in handle) - 1, 0)
-
-
-def rows_from_manifest(manifest: Path, args: argparse.Namespace) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    total = manifest_data_row_count(manifest)
-    progress = ProgressReporter(not args.no_progress, total, args.progress_interval_sec, "Dataset counts")
-    progress.update(0, force=True)
-    with manifest.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for index, row in enumerate(reader, start=1):
-            if row.get("status") == "ok":
-                output_path = row.get("output_path", "")
-                rows.append(
-                    {
-                        "label": row.get("label", ""),
-                        "path": output_path,
-                        "decode_status": row.get("decode_status", "") or ("recover" if "_recover" in Path(output_path).stem else "primary"),
-                        "exists": Path(output_path).exists() if output_path else False,
-                    }
-                )
-            progress.update(index)
-    progress.update(total, force=True)
-    progress.finish()
-    return rows
-
-
-def rows_from_raw_root(raw_root: Path, args: argparse.Namespace) -> list[dict[str, object]]:
-    audio_paths = [
-        audio_path
-        for class_dir in sorted(path for path in raw_root.iterdir() if path.is_dir())
-        for audio_path in sorted(path for path in class_dir.rglob("*") if path.is_file())
-        if audio_path.suffix.lower() in AUDIO_EXTS
-    ]
-    progress = ProgressReporter(not args.no_progress, len(audio_paths), args.progress_interval_sec, "Dataset counts")
-    rows: list[dict[str, object]] = []
-    progress.update(0, force=True)
-    for index, audio_path in enumerate(audio_paths, start=1):
-        rows.append(
-            {
-                "label": audio_path.parent.name,
-                "path": str(audio_path),
-                "decode_status": "recover" if "_recover" in audio_path.stem else "primary",
-                "exists": True,
-            }
-        )
-        progress.update(index)
-    progress.update(len(audio_paths), force=True)
-    progress.finish()
-    return rows
-
-
-def summarize_dataset(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+def generate_expected_dataset_counts(args: argparse.Namespace, row_report: list[dict[str, object]]) -> list[dict[str, object]]:
     grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
-    for row in rows:
-        label = str(row.get("label") or "").strip()
+    for row in row_report:
+        if row.get("objective_extractable") != "是":
+            continue
+        label = normalize_label_text(row.get("label"))
         if label:
             grouped[label].append(row)
+
     report_rows: list[dict[str, object]] = []
     for label in sorted(grouped):
         items = grouped[label]
-        decode_counts = Counter(str(item.get("decode_status") or "unknown") for item in items)
+        row_indices = [int(item["row_index"]) for item in items if str(item.get("row_index") or "").isdigit()]
+        start_times = sorted(str(item.get("start_time") or "") for item in items if item.get("start_time"))
         report_rows.append(
             {
                 "label": label,
-                "count": len(items),
-                "primary_count": decode_counts.get("primary", 0),
-                "recover_count": decode_counts.get("recover", 0),
-                "other_decode_count": len(items) - decode_counts.get("primary", 0) - decode_counts.get("recover", 0),
+                "expected_count": len(items),
+                "first_row_index": min(row_indices) if row_indices else "",
+                "last_row_index": max(row_indices) if row_indices else "",
+                "first_time": start_times[0] if start_times else "",
+                "last_time": start_times[-1] if start_times else "",
             }
         )
-    report_rows.sort(key=lambda item: (-int(item["count"]), str(item["label"])))
+    report_rows.sort(key=lambda item: (-int(item["expected_count"]), str(item["label"])))
+    write_csv(
+        data_dir(args) / "expected_dataset_counts.csv",
+        report_rows,
+        ["label", "expected_count", "first_row_index", "last_row_index", "first_time", "last_time"],
+    )
     return report_rows
 
 
-def generate_dataset_counts(args: argparse.Namespace) -> None:
-    if args.manifest.exists():
-        rows = rows_from_manifest(args.manifest, args)
-    elif args.raw_root.exists():
-        rows = rows_from_raw_root(args.raw_root, args)
+def write_expected_dataset_counts_txt(args: argparse.Namespace, expected_rows: list[dict[str, object]]) -> None:
+    total = sum(int(row["expected_count"]) for row in expected_rows)
+    lines = [
+        "预计生成数据集类别统计",
+        "",
+        f"可生成类别数: {len(expected_rows)}",
+        f"可生成音频总数: {total}",
+        "",
+        "类别明细:",
+    ]
+    if expected_rows:
+        for row in expected_rows:
+            lines.append(f"- {row['label']}: {row['expected_count']}")
     else:
-        return
-    report_rows = summarize_dataset(rows)
-    write_csv(data_dir(args) / "dataset_counts.csv", report_rows, ["label", "count", "primary_count", "recover_count", "other_decode_count"])
-    return report_rows
+        lines.append("无")
+    (human_dir(args) / "expected_dataset_counts.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def write_human_reports(
@@ -767,66 +795,98 @@ def write_human_reports(
     row_report: list[dict[str, object]],
     dates: list[str],
     files_by_day: dict[str, int],
-    dataset_rows: list[dict[str, object]] | None,
+    expected_dataset_rows: list[dict[str, object]],
 ) -> None:
     hdir = human_dir(args)
     hdir.mkdir(parents=True, exist_ok=True)
     category_counts = Counter(row.get("final_category", "") for row in row_report)
-    problem_rows = [row for row in row_report if row.get("final_category") == "问题信号"]
-    invalid_count = category_counts.get("已标注无效信号", 0)
-    denominator = invalid_count + len(problem_rows)
-    invalid_coverage_rate = invalid_count / denominator if denominator else 1.0
+    judged_rows = [row for row in row_report if row.get("final_category") != "未参与判断"]
+    extractable_rows = [row for row in judged_rows if row.get("objective_extractable") == "是"]
+    unextractable_rows = [row for row in judged_rows if row.get("objective_extractable") == "否"]
+    problem_labeled_rows = [row for row in judged_rows if row.get("problem_label") == "是"]
+    true_problem_labeled_rows = [row for row in judged_rows if row.get("label_match_status") == "不可提取且已标问题信号"]
+    missing_problem_label_rows = [row for row in judged_rows if row.get("label_match_status") == "不可提取但未标问题信号"]
+    false_problem_label_rows = [row for row in judged_rows if row.get("label_match_status") == "可提取但被标问题信号"]
+    unextractable_reason_counts = Counter(
+        row.get("not_extractable_reason") or "未分类"
+        for row in unextractable_rows
+    )
+    expected_total = sum(int(row["expected_count"]) for row in expected_dataset_rows)
+    coverage_rate = len(true_problem_labeled_rows) / len(unextractable_rows) if unextractable_rows else 1.0
+    precision_rate = len(true_problem_labeled_rows) / len(problem_labeled_rows) if problem_labeled_rows else 1.0
+    perfect_overlap = not missing_problem_label_rows and not false_problem_label_rows
 
     lines = [
         "卫星音频数据集分割前检查摘要",
         "",
         "一、结论",
-        f"  可提取: {category_counts.get('可提取', 0)}",
-        f"  已标注无效信号: {invalid_count}",
-        f"  未知/未分辨信号: {category_counts.get('未知/未分辨信号', 0)}",
-        f"  问题信号: {len(problem_rows)}",
-        f"  无效信号对问题行的覆盖率: {invalid_coverage_rate:.1%}",
+        f"  参与判断总数: {len(judged_rows)}",
+        f"  可提取信号: {len(extractable_rows)}",
+        f"  不可提取信号: {len(unextractable_rows)}",
+        f"  未参与判断: {category_counts.get('未参与判断', 0)}",
         "",
-        "二、Excel 标注检查",
+        f"  人工标注为问题信号: {len(problem_labeled_rows)}",
+        f"  不可提取且已标问题信号: {len(true_problem_labeled_rows)}",
+        f"  不可提取但未标问题信号: {len(missing_problem_label_rows)}",
+        f"  可提取但被标问题信号: {len(false_problem_label_rows)}",
+        "",
+        f"  问题信号标注覆盖率: {coverage_rate:.1%}",
+        f"  问题信号标注准确率: {precision_rate:.1%}",
+        f"  问题信号标注是否完全重合: {'是' if perfect_overlap else '否'}",
+        "",
+        "二、不可提取原因",
+        f"  {UNRECORDED_CENTER_FREQ_REASON}: {unextractable_reason_counts.get(UNRECORDED_CENTER_FREQ_REASON, 0)}",
+        f"  起止时间无效: {unextractable_reason_counts.get('起止时间无效', 0)}",
+        f"  无录音覆盖: {unextractable_reason_counts.get('无录音覆盖', 0)}",
+        f"  录音部分覆盖: {unextractable_reason_counts.get('录音部分覆盖', 0)}",
+        f"  检查出错: {unextractable_reason_counts.get('检查出错', 0)}",
+        "",
+        "三、预计生成数据集统计",
+        f"  可生成类别数: {len(expected_dataset_rows)}",
+        f"  可生成音频总数: {expected_total}",
+        f"  明细文件: {data_dir(args) / 'expected_dataset_counts.csv'}",
+        "",
+        "四、Excel 标注检查",
         f"  Excel 文件: {args.excel}",
         f"  工作表: {worksheet_title}",
-        f"  列配置: 起始时间={args.start_col}, 结束时间={args.end_col}, 推测卫星={args.label_col}, 无效信号={args.invalid_col}",
+        f"  列配置: 起始时间={args.start_col}, 结束时间={args.end_col}, 推测卫星={args.label_col}, 无效信号={args.invalid_col}, 中频={args.center_freq_col}",
     ]
     for key in sorted(annotation_counts):
         lines.append(f"  {ANNOTATION_STATUS_ZH.get(key, key)}: {annotation_counts[key]}")
     lines.append("  无效信号列异常值: " + ("无" if not unexpected_invalid_values else ", ".join(f"{k}={v}" for k, v in unexpected_invalid_values.items())))
     lines += [
         "",
-        "三、服务器录音库存",
+        "五、服务器录音库存",
         f"  录音根目录: {args.audio_root}",
         f"  扫描日期: {dates[0] if dates else '无'} 至 {dates[-1] if dates else '无'}",
         f"  日期数量: {len(dates)}",
         f"  录音文件总数: {sum(files_by_day.values())}",
         "",
-        "四、输出文件",
+        "六、输出文件",
         f"  机器明细: {data_dir(args)}",
         f"  人工摘要: {hdir}",
     ]
-    if dataset_rows is not None:
-        total = sum(int(row["count"]) for row in dataset_rows)
-        recover_total = sum(int(row["recover_count"]) for row in dataset_rows)
-        lines += [
-            "",
-            "五、已有数据集统计",
-            f"  卫星/类别数: {len(dataset_rows)}",
-            f"  音频总数: {total}",
-            f"  容错恢复提取数量: {recover_total}",
-        ]
     (hdir / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     problem_lines = [
-        "问题信号明细",
+        "问题信号标注重合检查明细",
         "",
-        "说明: 问题信号 = 不能完整提取，且没有被标为无效信号，需要人工检查 Excel 或录音文件。",
+        "说明: 问题信号 = 客观不可提取的行，包括起止时间无效、录音不完整或没有覆盖，以及中频为 5400 的行。",
+        "这里列出客观不可提取但未标问题信号的漏标行，以及客观可提取但被标问题信号的误标行。",
         "",
+        "一、不可提取但未标问题信号",
     ]
-    if problem_rows:
-        for row in problem_rows:
+    if missing_problem_label_rows:
+        for row in missing_problem_label_rows:
+            problem_lines.append(f"- {format_problem_row(row)}")
+    else:
+        problem_lines.append("无")
+    problem_lines += [
+        "",
+        "二、可提取但被标问题信号",
+    ]
+    if false_problem_label_rows:
+        for row in false_problem_label_rows:
             problem_lines.append(f"- {format_problem_row(row)}")
     else:
         problem_lines.append("无")
@@ -835,6 +895,8 @@ def write_human_reports(
 
 def main() -> int:
     args = parse_args()
+    if args.excel is None:
+        args.excel = discover_annotation_excel()
     raise_csv_field_limit()
     if args.clear_output_dir:
         safe_clear_report_dir(args.output_dir)
@@ -849,10 +911,18 @@ def main() -> int:
     else:
         inventory_rows, dates, files_by_day = generate_audio_inventory(args)
     row_report, coverage_counts = generate_row_report(args, annotation_rows)
-    dataset_rows = None
-    if not args.skip_dataset_counts:
-        dataset_rows = generate_dataset_counts(args)
-    write_human_reports(args, annotation_counts, unexpected_invalid_values, worksheet_title, row_report, dates, files_by_day, dataset_rows)
+    expected_dataset_rows = generate_expected_dataset_counts(args, row_report)
+    write_expected_dataset_counts_txt(args, expected_dataset_rows)
+    write_human_reports(
+        args,
+        annotation_counts,
+        unexpected_invalid_values,
+        worksheet_title,
+        row_report,
+        dates,
+        files_by_day,
+        expected_dataset_rows,
+    )
     print(f"Reports written to: {args.output_dir}")
     return 0
 
